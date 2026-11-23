@@ -332,6 +332,10 @@ mock.onDelete(apiPath('/cart')).reply((config) => {
 }
 
 /* ---------------- 订单 ---------------- */
+// 订单已接入真实后端（M4）。改回 true 可以退回假数据调 UI。
+const MOCK_ORDER = false
+
+if (MOCK_ORDER) {
 mock.onPost(apiPath('/orders')).reply((config) => {
   const user = currentUser(config)
   if (!user) return unauthorized()
@@ -429,6 +433,15 @@ mock.onPost(subPath('/orders', 'confirm')).reply((config) => {
   save('orders', orders)
   return ok(order)
 })
+
+} else {
+  // 注册过 handler 就会被拦截，必须显式放行到真实后端
+  mock.onPost(apiPath('/orders')).passThrough()
+  mock.onGet(apiPath('/orders')).passThrough()
+  mock.onGet(detailPath('/orders')).passThrough()
+  mock.onPost(subPath('/orders', 'cancel')).passThrough()
+  mock.onPost(subPath('/orders', 'confirm')).passThrough()
+}
 
 // 未匹配的请求不再用 mock.onAny() 兜底：那种写法会把「已接入真实后端」的接口
 // 一起拦成 404。改为在构造时设置 onNoMatch: 'passthrough'，未 mock 的请求直接放行到后端。
