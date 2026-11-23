@@ -156,6 +156,38 @@ class OrderServiceTest {
                 "如果 restoreStock 加了 deleted = 0，这里会得到 3 —— 库存永久少 2 且不报错");
     }
 
+    @Test
+    @DisplayName("单价上限 × 数量上限：总额能落库（orders.total_amount 已扩到 DECIMAL(14,2)）")
+    void createOrder_maxPriceStillFitsTotalAmountColumn() {
+        // 常规商品库存只有 5，这里单独造一个「贵且多」的商品
+        Product expensive = new Product();
+        expensive.setCategoryId(1L);
+        expensive.setName("【集成测试】满额商品");
+        expensive.setSubtitle("max amount test");
+        expensive.setPrice(new BigDecimal("999999.99"));
+        expensive.setOriginalPrice(new BigDecimal("999999.99"));
+        expensive.setStock(1000);
+        expensive.setSales(0);
+        expensive.setStatus(1);
+        expensive.setCover("/covers/0.svg");
+        expensive.setDescription("验证订单总额列容量");
+        expensive.setDeleted(0);
+        productMapper.insert(expensive);
+
+        OrderVO order = orderService.create(TEST_USER_ID, requestOf(expensive.getId(), 999));
+
+        // 999999.99 × 999 = 998,999,990.01：9 位整数，
+        // 旧的 DECIMAL(10,2)（上限 99,999,999.99）会在这里抛 Out of range value。
+        BigDecimal expected = new BigDecimal("998999990.01");
+        assertEquals(0, expected.compareTo(order.getTotalAmount()),
+                "金额由服务端重算，实际: " + order.getTotalAmount());
+
+        BigDecimal stored = jdbcTemplate.queryForObject(
+                "SELECT total_amount FROM orders WHERE id = ?", BigDecimal.class, order.getId());
+        assertEquals(0, expected.compareTo(stored),
+                "总额必须原样落库。这里失败通常意味着没跑 sql/08_money_precision.sql");
+    }
+
     private OrderCreateRequest requestOf(Long productId, int quantity) {
         OrderItemRequest item = new OrderItemRequest();
         item.setProductId(productId);

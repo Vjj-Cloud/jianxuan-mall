@@ -1,6 +1,7 @@
 package com.jack.jianxuan.dto;
 
 import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.Digits;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -47,11 +48,32 @@ public class ProductSaveRequest {
     @Size(max = 200, groups = {Create.class, Update.class}, message = "副标题最多 200 个字符")
     private String subtitle;
 
+    /**
+     * 售价。
+     *
+     * <p><b>为什么是 @Digits(integer = 6) 而不是照着列宽写 8：</b>
+     * 列是 {@code DECIMAL(10,2)}（最多 8 位整数），照抄会允许 99,999,999.99。
+     * 而订单总额 = 单价 × 数量 × 商品数，quantity 上限 999、items 上限 50，
+     * 8 位整数能把总额推到 4.99e12，远超订单表的容量——那就只是把 500 从商品接口
+     * 挪到了下单接口。
+     *
+     * <p>所以这里取「业务上限」6 位整数（最大 999,999.99）：
+     * 50 × 999 × 999,999.99 ≈ 4.99e10，能安稳落在扩到 {@code DECIMAL(14,2)} 的
+     * {@code orders.total_amount} 里。**精度约束要按整条链路的容量倒推，不能只看单表。**
+     *
+     * <p>报错也从「系统繁忙」变成字段级提示：原来的 {@code DataIntegrityViolationException}
+     * （Out of range value）会落到全局异常兜底分支，用户看到的是 500。
+     */
     @NotNull(groups = Create.class, message = "售价不能为空")
     @DecimalMin(value = "0.01", groups = {Create.class, Update.class}, message = "售价必须大于 0")
+    @Digits(integer = 6, fraction = 2, groups = {Create.class, Update.class},
+            message = "售价最多 6 位整数、2 位小数（最大 999999.99）")
     private BigDecimal price;
 
+    /** 划线价：和售价同一套精度规则，否则「划线价越界」只是把 500 换了个字段。 */
     @DecimalMin(value = "0.00", groups = {Create.class, Update.class}, message = "划线价不能为负数")
+    @Digits(integer = 6, fraction = 2, groups = {Create.class, Update.class},
+            message = "划线价最多 6 位整数、2 位小数（最大 999999.99）")
     private BigDecimal originalPrice;
 
     @Min(value = 0, groups = {Create.class, Update.class}, message = "库存不能为负数")

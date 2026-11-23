@@ -14,7 +14,7 @@ CREATE TABLE `orders` (
   `id`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `order_no`         VARCHAR(32)     NOT NULL COMMENT '业务订单号，对用户展示用',
   `user_id`          BIGINT UNSIGNED NOT NULL,
-  `total_amount`     DECIMAL(10,2)   NOT NULL COMMENT '服务端算出的实付总额',
+  `total_amount`     DECIMAL(14,2)   NOT NULL COMMENT '服务端算出的实付总额',
   `status`           VARCHAR(20)     NOT NULL DEFAULT 'PENDING'
                      COMMENT 'PENDING/SHIPPED/COMPLETED/CANCELLED',
   `receiver_name`    VARCHAR(50)     NOT NULL DEFAULT '',

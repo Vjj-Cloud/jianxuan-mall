@@ -45,6 +45,16 @@ public class OrderService {
     private static final String COMPLETED = "COMPLETED";
     private static final String CANCELLED = "CANCELLED";
 
+    /**
+     * 单笔订单金额上限，和 {@code orders.total_amount DECIMAL(14,2)} 的容量对齐（12 位整数）。
+     *
+     * <p>正常情况下永远碰不到：单价上限 999999.99、数量上限 999、商品数上限 50，
+     * 最坏 4.99e10，比这个上限小两个数量级。它的作用是「上限被改动时的报警器」——
+     * 让错误停在业务层（400 + 能看懂的提示），而不是在 InnoDB 里变成一句
+     * {@code Out of range value for column 'total_amount'}，再被兜底分支翻译成「系统繁忙」。
+     */
+    private static final BigDecimal MAX_ORDER_AMOUNT = new BigDecimal("999999999999.99");
+
     private final OrderMapper orderMapper;
     private final OrderItemMapper orderItemMapper;
     private final ProductMapper productMapper;
@@ -113,7 +123,17 @@ public class OrderService {
             orderItems.add(orderItem);
         }
 
-        // 4. 原子扣库存。这是防超卖的真正防线：
+        // 4. 金额是算出来的，同样要防止「算得出来但存不下」。
+        //    商品单价、数量、商品数都已经有上限（见 ProductSaveRequest、OrderItemRequest），
+        //    按当前的限制算，最坏情况 50 × 999 × 999999.99 ≈ 4.99e10，落在 DECIMAL(14,2) 里。
+        //    这道检查是给「以后有人调高上限、却忘了同步表精度」留的兜底：
+        //    宁可在这里返回 400 并说明原因，也不要让 InnoDB 抛 Out of range 变成 500——
+        //    那时事务会回滚，但用户只看到「系统繁忙」，根本不知道是自己的单太大。
+        if (totalAmount.compareTo(MAX_ORDER_AMOUNT) > 0) {
+            throw new BusinessException(400, "订单金额超出单笔上限，请拆分成多笔下单");
+        }
+
+        // 5. 原子扣库存。这是防超卖的真正防线：
         //    上面的校验可能已经不成立了（并发请求在这期间把库存买走了），
         //    只有 UPDATE ... WHERE stock >= ? 还能给出最终答案。
         //    返回 0 行 → 抛异常 → 整个事务回滚，前面扣成功的商品也会一起撤销。
@@ -124,7 +144,7 @@ public class OrderService {
             }
         }
 
-        // 5. 写订单主表
+        // 6. 写订单主表
         Order order = new Order();
         order.setOrderNo(generateOrderNo());
         order.setUserId(userId);
@@ -147,18 +167,18 @@ public class OrderService {
         order.setUpdatedAt(now);
         orderMapper.insert(order);
 
-        // 6. 写明细（order.getId() 由 MyBatis 从自增主键回填）
+        // 7. 写明细（order.getId() 由 MyBatis 从自增主键回填）
         for (OrderItem orderItem : orderItems) {
             orderItem.setOrderId(order.getId());
             orderItemMapper.insert(orderItem);
         }
 
-        // 7. 把已下单的商品从购物车摘掉。in 条件用 productIds，用户可能只结算了购物车里的一部分。
+        // 8. 把已下单的商品从购物车摘掉。in 条件用 productIds，用户可能只结算了购物车里的一部分。
         cartItemMapper.delete(new LambdaQueryWrapper<CartItem>()
                 .eq(CartItem::getUserId, userId)
                 .in(CartItem::getProductId, productIds));
 
-        // 8. 事务提交之后再做两件事：投递「超时未支付自动取消」的延迟任务、让商品详情缓存失效。
+        // 9. 事务提交之后再做两件事：投递「超时未支付自动取消」的延迟任务、让商品详情缓存失效。
         //
         //    为什么不能写在方法体里：
         //    本方法带 @Transactional。写在这里的话，事务还没提交、Redis 就已经被改动了。

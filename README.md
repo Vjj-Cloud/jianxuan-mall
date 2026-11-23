@@ -119,7 +119,7 @@ mysql -u root -p -e "CREATE USER IF NOT EXISTS 'mall'@'localhost' IDENTIFIED BY 
 
 ```bash
 cd backend/src/main/resources/sql
-for f in 01_user.sql 02_seed_data.sql 03_product.sql 04_seed_product.sql 05_cart.sql 06_order.sql 07_order_idempotent.sql; do
+for f in 01_user.sql 02_seed_data.sql 03_product.sql 04_seed_product.sql 05_cart.sql 06_order.sql 07_order_idempotent.sql 08_money_precision.sql; do
   mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < "$f"
 done
 ```
@@ -128,8 +128,9 @@ done
 
 ```bash
 cd backend/src/main/resources/sql
-# 只跑这一个。跑 01-06 会删表，不是「幂等重跑」而是「重置环境」
+# 只跑这两个。跑 01-06 会删表，不是「幂等重跑」而是「重置环境」
 mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < 07_order_idempotent.sql
+mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < 08_money_precision.sql
 ```
 
 | 文件 | 内容 | 能否在已有数据的库上执行 |
@@ -141,8 +142,11 @@ mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < 07_order_idempot
 | `05_cart.sql` | 购物车表（`UNIQUE KEY (user_id, product_id)`） | ❌ 会 DROP |
 | `06_order.sql` | 订单 + 订单明细表 | ❌ 会 DROP |
 | `07_order_idempotent.sql` | 幂等列 + `uk_user_request` 唯一索引 + 历史数据回填 | ⚠️ 只能成功执行一次（重复执行报列已存在） |
+| `08_money_precision.sql` | `orders.total_amount` 扩到 `DECIMAL(14,2)` | ✅ 可重复执行（MODIFY 幂等） |
 
 如果要的是「一份可直接还原的完整快照」，用 `db/jianxuan_mall_20261123.sql`（含全部结构和数据）。
+这份快照导出时 `08` 还没出现，`orders.total_amount` 仍是 `DECIMAL(10,2)`，
+还原后请补跑一次 `08_money_precision.sql`。
 
 ### 2. 启动后端
 
@@ -491,7 +495,7 @@ const MOCK_ORDER = false
 - **前端最大包仍是 950 KB**：Element Plus 是 `app.use(ElementPlus)` 全量引入，
   路由已经懒加载、图标已经改成按需（省了约 144 KB），但组件库本体还是一次性打进主包。
   要根治得换成 `unplugin-vue-components` 按需组件引入，本项目没做（见 [`docs/M10-代码评审修复.md`](docs/M10-代码评审修复.md)）
-- **测试覆盖仍然有限**：24 个用例集中在「订单 + 幂等 + 缓存一致性 + 缓存失效容错 + 超时任务容错 + 注册校验」，
+- **测试覆盖仍然有限**：28 个用例集中在「订单 + 幂等 + 缓存一致性 + 缓存失效容错 + 超时任务容错 + 参数校验/金额精度」，
   用户/购物车/商品管理仍靠 `curl` 手工验证。
   真正的并发超卖没法用 JUnit 覆盖——测试事务里看不到其他线程未提交的数据，
   那部分由 `benchmark.py --scenario oversell` 承担（幂等的并发用例是例外：它刻意不加测试事务）
