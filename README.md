@@ -89,8 +89,13 @@ flowchart LR
 - JDK 17
 - Maven 3.9.x（3.10+ 与 IDEA 2024.3 的内嵌 Maven 不兼容，别用）
 - MySQL 8
-- **Redis 5+**（订单超时取消用；没启动的话后端能起来，但下单会报错）
-- Node.js 18+
+- **Redis 5+**（商品缓存、延迟队列、下单幂等键）
+- Node.js **20.19+ 或 22.12+**（Vite 8 的硬性要求；Node 18 会在 `npm install` 阶段直接报 engines 不匹配）
+
+关于 Redis 的可用性边界，说得准确一点：**没启动 Redis 时后端照样能启动，下单也能成功**。
+降级后失去的是三样东西，都不是「能不能下单」：商品详情缓存（退化为每次直查数据库）、
+下单幂等键（退化为只靠数据库唯一索引）、订单超时自动取消（任务每轮跳过，靠下次启动补灌）。
+这是刻意设计的——Redis 在这里是加速器，不是数据库，不能让它变成下单的单点故障。
 
 ### 1. 建库并初始化
 
@@ -103,22 +108,41 @@ mysql -u root -p -e "CREATE USER IF NOT EXISTS 'mall'@'localhost' IDENTIFIED BY 
 
 **执行 SQL 必须带 `--default-character-set=utf8mb4`**，否则中文商品名会报 `Data too long` 或存成乱码。
 
+> ⚠️ **`01`–`06` 是「空库初始化」脚本，不能当升级脚本用。**
+> 里面写的是 `DROP TABLE IF EXISTS` 和 `TRUNCATE TABLE`，在已经有数据的库上执行会**直接清空**商品、订单、购物车。
+> 只有一个例外：`07` 是真正的增量脚本（加 `request_id` 列 + 唯一索引 + 回填历史数据），
+> 全新库和已有库都要跑。注意它**只能成功执行一次**——第二次跑会报
+> `Duplicate column name 'request_id'`（列已加过），之后的两句同样会被跳过。
+> 看到这个报错就说明增量已经生效，不需要处理；这也是为什么它不是 `01`–`06` 那样的重建脚本。
+
+**首次初始化（空库）**：
+
 ```bash
 cd backend/src/main/resources/sql
-# 01-06 建表与种子数据，07 是增量脚本（加幂等列 + 唯一索引），全新库和已有库都要跑
 for f in 01_user.sql 02_seed_data.sql 03_product.sql 04_seed_product.sql 05_cart.sql 06_order.sql 07_order_idempotent.sql; do
   mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < "$f"
 done
 ```
 
-| 文件 | 内容 |
-|---|---|
-| `01_user.sql` | 用户表 |
-| `02_seed_data.sql` | 演示账号 |
-| `03_product.sql` | 分类 + 商品表 |
-| `04_seed_product.sql` | 5 个分类 + 16 个商品 |
-| `05_cart.sql` | 购物车表（`UNIQUE KEY (user_id, product_id)`） |
-| `06_order.sql` | 订单 + 订单明细表 |
+**已有数据的库（只补增量）**：
+
+```bash
+cd backend/src/main/resources/sql
+# 只跑这一个。跑 01-06 会删表，不是「幂等重跑」而是「重置环境」
+mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < 07_order_idempotent.sql
+```
+
+| 文件 | 内容 | 能否在已有数据的库上执行 |
+|---|---|---|
+| `01_user.sql` | 用户表 | ❌ 会 DROP |
+| `02_seed_data.sql` | 演示账号 | ⚠️ 会重复插入（撞唯一索引后报错） |
+| `03_product.sql` | 分类 + 商品表 | ❌ 会 DROP |
+| `04_seed_product.sql` | 5 个分类 + 17 个商品 | ❌ 会 TRUNCATE |
+| `05_cart.sql` | 购物车表（`UNIQUE KEY (user_id, product_id)`） | ❌ 会 DROP |
+| `06_order.sql` | 订单 + 订单明细表 | ❌ 会 DROP |
+| `07_order_idempotent.sql` | 幂等列 + `uk_user_request` 唯一索引 + 历史数据回填 | ⚠️ 只能成功执行一次（重复执行报列已存在） |
+
+如果要的是「一份可直接还原的完整快照」，用 `db/jianxuan_mall_20261123.sql`（含全部结构和数据）。
 
 ### 2. 启动后端
 
@@ -461,8 +485,13 @@ const MOCK_ORDER = false
   那是限流/风控的职责，本项目没做
 - **缓存删除失败只靠 TTL 兜底**：改商品时删缓存失败只记日志，最多脏 30 分钟。
   彻底解决要靠删缓存重试队列或订阅 binlog（Canal），本项目没上
-- **延迟任务没有重试上限**：`OrderTimeoutTask` 里处理失败会隔 60 秒重新入队，异常数据会一直重试。
-  生产上应该加重试计数 + 死信集合
+- **延迟任务的重试是「3 次后转死信」而不是自动修复**：失败订单会进 `order:delay:dead`，
+  需要人工捞出来处理。没有做死信的自动重放界面
 - **单机部署**：雪花 ID 的机器号由 MyBatis-Plus 自动推导，多实例部署需要显式配置 workerId
-- **测试覆盖有限**：只有订单模块的 5 个集成测试（下单扣减、库存不足、取消回补、重复取消、软删商品仍回补），其余靠 `curl` 手工验证。
-  并发超卖没法用 JUnit 覆盖——测试事务里看不到其他线程未提交的数据，所以那部分由 `benchmark.py --scenario oversell` 承担
+- **前端最大包仍是 950 KB**：Element Plus 是 `app.use(ElementPlus)` 全量引入，
+  路由已经懒加载、图标已经改成按需（省了约 144 KB），但组件库本体还是一次性打进主包。
+  要根治得换成 `unplugin-vue-components` 按需组件引入，本项目没做（见 [`docs/M10-代码评审修复.md`](docs/M10-代码评审修复.md)）
+- **测试覆盖仍然有限**：17 个用例集中在「订单 + 幂等 + 缓存一致性 + 超时任务容错」，
+  用户/购物车/商品管理仍靠 `curl` 手工验证。
+  真正的并发超卖没法用 JUnit 覆盖——测试事务里看不到其他线程未提交的数据，
+  那部分由 `benchmark.py --scenario oversell` 承担（幂等的并发用例是例外：它刻意不加测试事务）

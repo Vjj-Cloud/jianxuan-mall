@@ -89,7 +89,11 @@ async function submit() {
   // 前端第一道：按钮 loading 之外的兜底，挡住同一个页面内的连点。
   // 真正跨页面、跨设备、跨进程的重复，靠的是 requestId + 后端幂等。
   if (submitting.value) return
-  await formRef.value.validate()
+
+  // validate() 校验不通过时是 reject 而不是返回 false，不接住会变成未处理的 Promise 拒绝
+  const valid = await formRef.value.validate().catch(() => false)
+  if (!valid) return
+
   submitting.value = true
   try {
     await createOrder({
@@ -99,12 +103,26 @@ async function submit() {
       items: items.value.map((i) => ({ productId: i.productId, quantity: i.quantity })),
       ...form,
     })
-    // 这一单已经完成，换一个新的幂等键：
-    // 用户若退回本页再提交，那是一次新的购买意图，不该被当成重复请求。
-    requestId.value = genRequestId()
-    await cartStore.load()
+
+    // ---- 下单成功之后，这段代码里不允许再出现「可能失败的 await」 ----
+    //
+    // 之前这里是「先换 requestId、再 await cartStore.load()、最后才跳转」。
+    // 只要 load() 因为网络抖动抛错，用户就停在结算页不动，而 requestId 已经换成新的了：
+    // 他再点一次「提交订单」，后端认不出来这是同一次购买意图，于是生成第二笔订单。
+    // 这是最坏的一类 bug —— 用户以为失败了，其实钱货两清，还多买了一份。
+    //
+    // 两条规则：
+    // 1. requestId 不重置。万一跳转失败用户又点了一次，后端会把同一笔订单原样返回（幂等回放），
+    //    而不是再下一单。重新进入结算页会走 onMounted 重新生成，不会污染下一次购买。
+    // 2. 购物车刷新改为非阻塞。它失败了最多是右上角角标数字不对，
+    //    不能因此把「订单已创建」这个既成事实变成一次页面上的失败停留。
     ElMessage.success('下单成功')
-    router.replace({ path: '/orders', query: { created: 1 } })
+    cartStore.load().catch(() => {})
+    await router.replace({ path: '/orders', query: { created: 1 } })
+  } catch {
+    // 失败提示已由 axios 响应拦截器统一弹出（业务码 / 网络异常 / 401 跳登录）。
+    // 这里必须接住，否则 @click 处理函数里的 reject 会变成未处理的 Promise 拒绝，
+    // 控制台多一条红字，还会让人误以为按钮卡住了。
   } finally {
     submitting.value = false
   }

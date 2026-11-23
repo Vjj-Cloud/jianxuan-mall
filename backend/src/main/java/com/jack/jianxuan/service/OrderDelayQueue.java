@@ -27,6 +27,12 @@ public class OrderDelayQueue {
     /** 延迟队列的 key。member = orderId，score = 到期时间戳（毫秒）。 */
     public static final String KEY = "order:delay";
 
+    /** 重试计数：field = orderId，value = 已经重试过几次。 */
+    public static final String RETRY_KEY = "order:delay:retry";
+
+    /** 死信集合：member = orderId，score = 转入死信的时间戳。 */
+    public static final String DEAD_KEY = "order:delay:dead";
+
     /**
      * 原子地「取出并删除」已到期的任务。
      *
@@ -91,6 +97,50 @@ public class OrderDelayQueue {
     /** 队列里还剩多少待执行任务，仅用于排查和验证。 */
     public long size() {
         Long size = redisTemplate.opsForZSet().zCard(KEY);
+        return size == null ? 0 : size;
+    }
+
+    /**
+     * 处理失败后重新入队，并累计重试次数。
+     *
+     * <p>为什么必须有次数上限：没有上限时，一条「一取消就报错」的脏数据会被永远重试——
+     * 每分钟一次、日志里一条 ERROR，既清不掉也看不见（被自己的日志淹了）。
+     * 超过上限转进死信集合，从「无限重试的噪音」变成「一条待人工处理的记录」。
+     *
+     * <p>为什么不在 Redis 里做 INCR + ZADD 的原子脚本：
+     * 这两步之间中断的后果只是「少算一次重试次数」，最坏情况是多重试一轮，
+     * 不会丢订单、也不会重复取消（取消本身是条件 UPDATE 幂等的）。为一个不影响正确性的
+     * 计数引入 Lua，维护成本大于收益。
+     *
+     * @return true 表示已重新入队，false 表示超过上限、已转死信
+     */
+    public boolean pushForRetry(Long orderId, long delayMillis, int maxRetry) {
+        Long retried = redisTemplate.opsForHash()
+                .increment(RETRY_KEY, String.valueOf(orderId), 1);
+        if (retried != null && retried > maxRetry) {
+            // 转死信：从延迟队列里彻底摘掉，只留一条记录等人查
+            redisTemplate.opsForZSet().remove(KEY, String.valueOf(orderId));
+            redisTemplate.opsForZSet().add(DEAD_KEY, String.valueOf(orderId), System.currentTimeMillis());
+            redisTemplate.opsForHash().delete(RETRY_KEY, String.valueOf(orderId));
+            return false;
+        }
+        push(orderId, delayMillis);
+        return true;
+    }
+
+    /**
+     * 成功处理后清掉重试计数。
+     *
+     * <p>不清理的话，同一个订单 id 的计数会一直留着：这次重试了 2 次成功，
+     * 下次（哪怕是完全无关的另一轮补灌）只要再失败一次就到上限了，等于提前消耗了配额。
+     */
+    public void clearRetry(Long orderId) {
+        redisTemplate.opsForHash().delete(RETRY_KEY, String.valueOf(orderId));
+    }
+
+    /** 死信集合大小，用于排查和验证。 */
+    public long deadLetterSize() {
+        Long size = redisTemplate.opsForZSet().zCard(DEAD_KEY);
         return size == null ? 0 : size;
     }
 }

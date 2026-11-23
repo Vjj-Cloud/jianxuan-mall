@@ -10,6 +10,7 @@ import com.jack.jianxuan.dto.ProductVO;
 import com.jack.jianxuan.service.ProductService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -42,16 +43,20 @@ public class ProductAdminController {
     }
 
     @PostMapping
-    public Result<ProductVO> create(@Valid @RequestBody ProductSaveRequest req) {
+    public Result<ProductVO> create(
+            @Validated(ProductSaveRequest.Create.class) @RequestBody ProductSaveRequest req) {
         return Result.ok(productService.create(req));
     }
 
     /**
-     * 编辑。注意这里没有 @Valid：接口约定是「字段均可选，只更新传入项」，
-     * 如果加了 @Valid，那些 @NotNull 会强制前端每次都全量提交。
+     * 编辑。字段全部可选，只更新传入项 —— 所以这里用的是 Update 分组：
+     * 不校验“必填”（那是新增的事），但仍然校验长度、非负这类格式规则。
+     * 直接写 @Valid 会把 @NotNull 一起带上，逼前端每次全量提交。
      */
     @PutMapping("/{id}")
-    public Result<ProductVO> update(@PathVariable Long id, @RequestBody ProductSaveRequest req) {
+    public Result<ProductVO> update(@PathVariable Long id,
+                                    @Validated(ProductSaveRequest.Update.class)
+                                    @RequestBody ProductSaveRequest req) {
         return Result.ok(productService.update(id, req));
     }
 

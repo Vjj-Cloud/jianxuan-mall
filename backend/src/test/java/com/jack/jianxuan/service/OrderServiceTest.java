@@ -162,6 +162,10 @@ class OrderServiceTest {
         item.setQuantity(quantity);
 
         OrderCreateRequest request = new OrderCreateRequest();
+        // 幂等键必须给：uk_user_request 是 (user_id, request_id) 唯一索引，
+        // 不设的话插进去的是 NULL，唯一索引对 NULL 不生效（NULL != NULL）。
+        // 那样测试虽然能过，但等于把「真实请求长什么样」这件事测掉了。
+        request.setRequestId("svc-" + System.nanoTime());
         request.setItems(List.of(item));
         request.setReceiverName("集成测试");
         request.setReceiverPhone("13800138000");

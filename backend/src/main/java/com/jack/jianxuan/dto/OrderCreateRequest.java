@@ -33,7 +33,16 @@ public class OrderCreateRequest {
     @Pattern(regexp = "^[A-Za-z0-9_-]{8,64}$", message = "幂等键格式不合法")
     private String requestId;
 
+    /**
+     * 结算的商品行。
+     *
+     * <p>必须有条数上限：没有上限时，一个请求可以塞进来几万行，
+     * 后面的 {@code selectBatchIds} 会拼出一条几万项的 IN 子句（MySQL 直接报 SQL 过长），
+     * 就算没报错，一次事务里扣几万次库存也会长时间持锁、拖垮其他下单请求。
+     * 正常人一次结算几十种商品就顶天了，50 是宽松但有意义的边界。
+     */
     @NotEmpty(message = "请选择要购买的商品")
+    @Size(max = 50, message = "一次最多结算 50 种商品")
     @Valid
     private List<OrderItemRequest> items;
 

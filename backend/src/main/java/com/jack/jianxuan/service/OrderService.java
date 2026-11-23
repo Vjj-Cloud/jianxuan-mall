@@ -50,7 +50,7 @@ public class OrderService {
     private final ProductMapper productMapper;
     private final CartItemMapper cartItemMapper;
     private final OrderDelayQueue orderDelayQueue;
-    private final ProductService productService;
+    private final ProductCacheEvictor cacheEvictor;
 
     /**
      * 创建订单。
@@ -63,7 +63,19 @@ public class OrderService {
         // 1. 合并同一商品的多行。前端理论上不会重复传，但重复传会导致同一商品被扣两次。
         Map<Long, Integer> quantityByProduct = new LinkedHashMap<>();
         for (OrderItemRequest item : request.getItems()) {
+            // 这里再挡一次，不只是为了「优雅」：Integer::sum 溢出后是负数，
+            // 而负数量会让 stock >= quantity 恒真、stock - quantity 变成加库存，
+            // 直接产出一笔负金额订单。校验注解是第一道，Service 自保是第二道——
+            // 万一将来有人从别处（定时任务、RPC）直接调这个方法，注解是拦不住的。
+            if (item.getQuantity() == null || item.getQuantity() <= 0) {
+                throw new BusinessException(400, "购买数量不合法");
+            }
             quantityByProduct.merge(item.getProductId(), item.getQuantity(), Integer::sum);
+        }
+        for (Map.Entry<Long, Integer> entry : quantityByProduct.entrySet()) {
+            if (entry.getValue() <= 0) {
+                throw new BusinessException(400, "购买数量不合法");
+            }
         }
 
         // 2. 按 productId 升序处理。多商品下单时，如果 A 用户先锁商品1再锁商品2、
@@ -167,7 +179,9 @@ public class OrderService {
                     // 彻底的做法是本地消息表：把「待投递」和业务数据写进同一个事务，再由后台重试。
                     log.error("订单 {} 投递超时任务失败，需要补灌兜底", createdOrderId, e);
                 }
-                evictProductCaches(productIds);
+                // 这里用 evictNow 而不是 evictAfterCommit：afterCommit 阶段同步器仍是激活状态，
+                // 再注册一个不会被回调（见 ProductCacheEvictor 的注释）。
+                cacheEvictor.evictNow(productIds);
             }
         });
 
@@ -218,31 +232,12 @@ public class OrderService {
             productMapper.restoreStock(item.getProductId(), item.getQuantity());
             productIds.add(item.getProductId());
         }
-        // 库存回补了，商品详情缓存里的 stock 就成了错的。删缓存放在事务提交前是安全的：
-        // 万一事务回滚，说明库存根本没回补，下次读回源拿到的仍然是正确值。
-        // 会「脏」的从来是「更新缓存」，不是「删除缓存」——这就是 Cache-Aside 删缓存的好处。
-        evictProductCaches(productIds);
+        // 库存回补了，商品详情缓存里的 stock 就成了错的。删缓存必须等到事务提交之后：
+        // 提交前删，会有一个「别的读请求回源读到旧库存、再写回缓存」的窗口，
+        // 而那个旧值会在 TTL（30 分钟）内没有任何人纠正它。
+        // 详见 ProductCacheEvictor 的类注释（里面画了时序）。
+        cacheEvictor.evictAfterCommit(productIds);
         return true;
-    }
-
-    /**
-     * 让这些商品的详情缓存失效。
-     *
-     * <p>商品详情里带着 stock 和 sales，而这两项每笔订单都会变。不删缓存的话，用户在
-     * TTL（30 分钟）内会一直看到旧库存，出现「页面显示有货、下单却提示库存不足」。
-     *
-     * <p>这是一个明确的取舍：热点商品被频繁下单时，缓存会反复失效、命中率下降。
-     * 之所以接受，是因为商品详情是「读远多于写」的场景（浏览下单的比例通常几十比一），
-     * 而且库存准确性比命中率重要得多。
-     *
-     * <p>如果某天真到了「下单频率高到缓存基本用不上」的量级，正确的做法不是停止删缓存，
-     * 而是把「库存」从商品详情里拆出去做成独立的短 TTL 接口，详情页只缓存静态字段。
-     * 能说清这条演进路径，比一开始就上复杂方案更有说服力。
-     */
-    private void evictProductCaches(List<Long> productIds) {
-        for (Long productId : productIds) {
-            productService.evictDetail(productId);
-        }
     }
 
     /** 用户端：只看自己的订单 */
@@ -334,8 +329,9 @@ public class OrderService {
             productMapper.restoreStock(item.getProductId(), item.getQuantity());
             productIds.add(item.getProductId());
         }
-        // 库存回补后必须删掉商品详情缓存，否则用户在 TTL 内看到的还是扣减后的库存
-        evictProductCaches(productIds);
+        // 库存回补后必须删掉商品详情缓存，否则用户在 TTL 内看到的还是扣减后的库存。
+        // 同样放到提交之后（延迟双删），理由见 cancelBySystem。
+        cacheEvictor.evictAfterCommit(productIds);
         return detail(userId, orderId);
     }
 
