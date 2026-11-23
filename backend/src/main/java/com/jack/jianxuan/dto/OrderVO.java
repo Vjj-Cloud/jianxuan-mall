@@ -1,6 +1,7 @@
 package com.jack.jianxuan.dto;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.jack.jianxuan.entity.Order;
 import com.jack.jianxuan.entity.OrderItem;
 import lombok.Data;
@@ -15,6 +16,13 @@ public class OrderVO {
 
     private Long id;
     private String orderNo;
+    /**
+     * 只有管理端才输出这个字段：管理员需要知道「这是谁下的单」，
+     * 而用户端查自己的订单时，userId 恒等于自己，返回出去既没用又多余。
+     * NON_NULL 让它自然消失——用户端不 set，JSON 里就不出现这个 key。
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private Long userId;
     private List<OrderItemVO> items;
     private BigDecimal totalAmount;
     /** PENDING / SHIPPED / COMPLETED / CANCELLED，前端直接拿来做按钮显隐 */
@@ -36,9 +44,16 @@ public class OrderVO {
 
     public static OrderVO from(Order order, List<OrderItem> items) {
         OrderVO vo = new OrderVO();
-        // userId 不在 VO 里：用户只能看自己的订单，把 userId 暴露出去没有任何意义
-        BeanUtils.copyProperties(order, vo, "items");
+        // 第三个参数是「忽略列表」：items 要手动转换，userId 默认不带
+        BeanUtils.copyProperties(order, vo, "items", "userId");
         vo.setItems(items.stream().map(OrderItemVO::from).toList());
+        return vo;
+    }
+
+    /** 管理端专用：在用户端 VO 的基础上补上 userId */
+    public static OrderVO fromAdmin(Order order, List<OrderItem> items) {
+        OrderVO vo = from(order, items);
+        vo.setUserId(order.getUserId());
         return vo;
     }
 }

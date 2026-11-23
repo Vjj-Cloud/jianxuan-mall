@@ -142,14 +142,30 @@ public class OrderService {
         return OrderVO.from(order, orderItems);
     }
 
+    /** 用户端：只看自己的订单 */
     public PageResult<OrderVO> page(Long userId, OrderQuery query) {
+        return queryPage(userId, query);
+    }
+
+    /** 管理端：查全部用户的订单，userId 传 null 表示不限制归属 */
+    public PageResult<OrderVO> adminPage(OrderQuery query) {
+        return queryPage(null, query);
+    }
+
+    private PageResult<OrderVO> queryPage(Long userId, OrderQuery query) {
         long pageNo = query.getPage() == null || query.getPage() < 1 ? 1 : query.getPage();
         long pageSize = query.getSize() == null || query.getSize() < 1 ? 10 : Math.min(query.getSize(), 50);
 
+        // 必须先算出来：condition 为 false 只能让 MP 跳过拼接 SQL，
+        // 拦不住 Java 提前求值 query.getKeyword().trim()——搜索框为空时这里就是 NPE。
+        String keyword = StringUtils.hasText(query.getKeyword()) ? query.getKeyword().trim() : null;
+
         LambdaQueryWrapper<Order> wrapper = new LambdaQueryWrapper<Order>()
-                // 只查自己的订单：条件写死在 SQL 里，不依赖前端传 userId
-                .eq(Order::getUserId, userId)
+                // userId 为 null 时整段条件不拼进 SQL，管理员据此看到所有订单；
+                // 用户端 userId 恒非空，所以「只查自己」这条防线依然生效。
+                .eq(userId != null, Order::getUserId, userId)
                 .eq(StringUtils.hasText(query.getStatus()), Order::getStatus, query.getStatus())
+                .like(keyword != null, Order::getOrderNo, keyword)
                 .orderByDesc(Order::getId);
 
         Page<Order> page = orderMapper.selectPage(new Page<>(pageNo, pageSize), wrapper);
@@ -157,8 +173,15 @@ public class OrderService {
         Map<Long, List<OrderItem>> itemsByOrder = loadItems(
                 records.stream().map(Order::getId).toList());
 
+        // 管理端才带 userId：用户看自己的订单，这个字段没有意义
+        boolean withUserId = userId == null;
         List<OrderVO> list = records.stream()
-                .map(o -> OrderVO.from(o, itemsByOrder.getOrDefault(o.getId(), List.of())))
+                .map(o -> {
+                    List<OrderItem> items = itemsByOrder.getOrDefault(o.getId(), List.of());
+                    return withUserId
+                            ? OrderVO.fromAdmin(o, items)
+                            : OrderVO.from(o, items);
+                })
                 .toList();
         return PageResult.of(list, page.getTotal(), pageNo, pageSize);
     }
@@ -231,6 +254,43 @@ public class OrderService {
             throw new BusinessException(400, "订单状态已变更，请刷新后重试");
         }
         return detail(userId, orderId);
+    }
+
+    /**
+     * 发货：仅 PENDING → SHIPPED。
+     *
+     * 跟 cancel / confirm 一样用「带条件的 UPDATE」：
+     * 两个管理员同时点发货，只有第一个能命中 PENDING（影响 1 行），
+     * 第二个命中 0 行直接报错，不会出现重复发货或 shipped_at 被覆盖。
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public OrderVO ship(Long orderId) {
+        Order order = orderMapper.selectById(orderId);
+        if (order == null) {
+            throw new BusinessException(404, "订单不存在");
+        }
+        if (!PENDING.equals(order.getStatus())) {
+            throw new BusinessException(400, "只有待发货的订单可以发货");
+        }
+
+        LocalDateTime now = LocalDateTime.now();
+        int rows = orderMapper.update(null, new LambdaUpdateWrapper<Order>()
+                .eq(Order::getId, orderId)
+                .eq(Order::getStatus, PENDING)
+                .set(Order::getStatus, SHIPPED)
+                // 这一列最容易漏。只改 status 不改 shipped_at，前端「已发货」永远没有时间，
+                // 而且数据库那边也没有 ON UPDATE 能帮你补——它只自动维护 updated_at。
+                .set(Order::getShippedAt, now)
+                .set(Order::getUpdatedAt, now));
+        if (rows == 0) {
+            throw new BusinessException(400, "订单状态已变更，请刷新后重试");
+        }
+
+        // 重新查一次拿最新状态。直接改内存里的 order 对象也行，但那等于在 Java 里
+        // 手写一份「数据库刚刚做了什么」的副本，字段一多就容易漏，不如查库。
+        Order updated = orderMapper.selectById(orderId);
+        return OrderVO.fromAdmin(updated,
+                loadItems(List.of(orderId)).getOrDefault(orderId, List.of()));
     }
 
     /** 一次 IN 查完所有订单的明细，避免「每条订单查一次」的 N+1。 */

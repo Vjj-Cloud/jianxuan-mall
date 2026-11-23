@@ -213,36 +213,7 @@ if (MOCK_AUTH) {
   mock.onGet(apiPath('/auth/me')).passThrough()
 }
 
-/* ---------------- 管理后台接口（先注册，避免与用户端路径冲突） ---------------- */
-const requireAdmin = (config) => {
-  const user = currentUser(config)
-  if (!user) return { error: unauthorized() }
-  if (user.role !== 'ADMIN') return { error: [403, { code: 403, message: '没有权限', data: null }] }
-  return { user }
-}
-
-/* 商品管理接口已接入真实后端，mock 注册统一挪到文件末尾「商品模块」那一段 */
-mock.onGet(apiPath('/admin/orders')).reply((config) => {
-  const auth = requireAdmin(config)
-  if (auth.error) return auth.error
-  const params = config.params || {}
-  let list = orders.slice().sort((a, b) => b.id - a.id)
-  if (params.status) list = list.filter((o) => o.status === params.status)
-  if (params.keyword) list = list.filter((o) => o.orderNo.includes(params.keyword))
-  return ok(paginate(list, params))
-})
-
-mock.onPut(subPath('/admin/orders', 'ship')).reply((config) => {
-  const auth = requireAdmin(config)
-  if (auth.error) return auth.error
-  const order = orders.find((o) => o.id === parseId(config))
-  if (!order) return fail('订单不存在', 404)
-  if (order.status !== 'PENDING') return fail('当前订单状态不可发货')
-  order.status = 'SHIPPED'
-  order.shippedAt = new Date().toISOString()
-  save('orders', orders)
-  return ok(order)
-})
+/* 管理后台接口全部接入真实后端（商品 M2、订单 M5），不再保留 mock 实现 */
 
 /* ---------------- 商品模块（已接入真实后端 M2，全部走 Spring Boot） ---------------- */
 // 注意：只要注册过 handler，mock 就会拦下来，不会自动落到真实后端，
@@ -441,6 +412,9 @@ mock.onPost(subPath('/orders', 'confirm')).reply((config) => {
   mock.onGet(detailPath('/orders')).passThrough()
   mock.onPost(subPath('/orders', 'cancel')).passThrough()
   mock.onPost(subPath('/orders', 'confirm')).passThrough()
+  // 管理端订单（M5）
+  mock.onGet(apiPath('/admin/orders')).passThrough()
+  mock.onPut(subPath('/admin/orders', 'ship')).passThrough()
 }
 
 // 未匹配的请求不再用 mock.onAny() 兜底：那种写法会把「已接入真实后端」的接口
