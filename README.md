@@ -81,7 +81,7 @@ flowchart LR
 ### 1. 建库并初始化
 
 ```bash
-# 先把 <db_password> 换成你要用的密码，并同步写进 application.yml
+# 先把 <db_password> 换成你要用的密码，记录好，下一步要写进 application-local.yml
 # 注意：不要用 root 跑应用，给应用单独建一个只有本库权限的账号
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS jianxuan_mall DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
 mysql -u root -p -e "CREATE USER IF NOT EXISTS 'mall'@'localhost' IDENTIFIED BY '<db_password>'; GRANT ALL ON jianxuan_mall.* TO 'mall'@'localhost';"
@@ -107,14 +107,20 @@ done
 
 ### 2. 启动后端
 
-按你的 MySQL 密码修改 `backend/src/main/resources/application.yml` 里的 `spring.datasource`：
+数据库口令和 JWT 密钥**不写在 `application.yml` 里**，而是放在被 `.gitignore` 排除的 `application-local.yml`：
 
-```yaml
-spring:
-  datasource:
-    username: mall
-    password: 你的密码
+```bash
+cd backend/src/main/resources
+cp application-local.yml.example application-local.yml
+# 然后编辑 application-local.yml，填入下面两项
 ```
+
+| 配置项 | 说明 |
+|---|---|
+| `spring.datasource.password` | 建库时给 `mall` 账号设的密码 |
+| `jwt.secret` | 至少 32 字节的随机串，`openssl rand -base64 48` 生成 |
+
+`application.yml` 里这两项是 `${DB_PASSWORD}` / `${JWT_SECRET}`，**故意不设默认值**。缺配置时会启动失败并提示 `Could not resolve placeholder` —— 这是有意的：让「没配对」立刻暴露，而不是带着一个默认弱口令静默跑起来。
 
 ```bash
 cd backend
@@ -240,7 +246,8 @@ Jack项目/
 │       │   ├── service/         业务逻辑与事务
 │       │   └── util/            JwtUtil
 │       └── resources/
-│           ├── application.yml
+│           ├── application.yml              主配置（口令/密钥为环境变量占位符）
+│           ├── application-local.yml.example 本地配置模板（复制为 .yml 后填真实值）
 │           └── sql/             01-06 建表与种子数据
 ├── frontend/                    Vue 3 前端
 ├── docs/                        各模块代码讲解、环境配置、API 文档、压测报告
