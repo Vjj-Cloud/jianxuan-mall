@@ -147,6 +147,25 @@ http://localhost:5173 —— `vite.config.js` 里已配 `/api` 代理到 8080。
 | `admin` | `admin123` | ADMIN，可进管理后台 |
 | `user` | `user123` | USER |
 
+### 4. 跑测试
+
+```bash
+cd backend
+mvn test
+```
+
+只有订单模块的集成测试（5 个），跑在真实 MySQL 上，`@Transactional` 自动回滚、不留脏数据。
+
+**不需要先启动后端** —— `@SpringBootTest` 用 MOCK 环境，不占 8080 端口；但 MySQL 必须在跑。
+
+| 用例 | 验证什么 |
+|---|---|
+| 下单成功 | 库存扣减、销量增加、金额由服务端重算（不采信前端） |
+| 库存不足 | 拒绝下单且不扣库存，消息里点名是哪件商品 |
+| 取消订单 | 状态变 CANCELLED，库存和销量都回到原值 |
+| 重复取消 | 第二次被拒绝 —— 否则库存会被回补两次 |
+| 软删商品后取消 | 库存仍回补，因为 `restoreStock` 的 WHERE 故意不带 `deleted` |
+
 ---
 
 ## 几个值得说的设计
@@ -163,7 +182,9 @@ UPDATE product
 
 返回 0 行就抛异常回滚。**「够不够」和「扣减」在同一条语句、同一把行锁里**，不存在「先查再改」的并发窗口。
 
-实测：库存 5，20 个线程同时下单 → 成功 5、失败 15、库存归零、订单数 5，零超卖。
+实测（`python scripts/benchmark.py --scenario oversell`，可复现）：库存 **10**，**32 个并发**同时下单 → 成功 10、失败 22、库存归零，零超卖。
+
+失败的 22 个里，17 个被下单前的预校验拦住，**5 个被这条 UPDATE 的 `stock >= ?` 拦住** —— 那 5 个请求预校验时还看到有库存，扣减那一刻被抢光了。这就是并发窗口，也正是这条 SQL 存在的理由。详见 [压测报告](docs/压测报告.md)。
 
 ### 2. 购物车：用唯一键当并发护栏
 
@@ -212,17 +233,19 @@ PENDING ──发货──> SHIPPED ──确认收货──> COMPLETED
 
 单机（客户端与服务端同机），脚本见 `scripts/benchmark.py`。
 
-| 场景 | QPS | 说明 |
+| 场景 | 结果 | 说明 |
 |---|---|---|
-| 商品列表（8 进程） | ~2400 | 客户端已到采样上限，服务端未饱和 |
-| 下单（单商品，8 并发） | 145 | 受热点行锁限制 |
-| 下单（分散 20 商品） | 506 | 同样的代码，锁粒度不同，差 3.5 倍 |
+| **超卖验证（10 件库存 / 32 并发）** | **0 超卖** | 成功 10、剩余库存 0，22 个失败全是业务拒绝 |
+| 商品列表（8 进程） | ~2400 QPS | 客户端已到采样上限，服务端未饱和 |
+| 下单（单商品，8 并发） | 145 QPS | 受热点行锁限制 |
+| 下单（分散 20 商品） | 506 QPS | 同样的代码，锁粒度不同，差 3.5 倍 |
 | 单请求基线 | 读 1.6ms / 下单 7.6ms | 单线程串行 20 次平均 |
 
 排查过程（订单号 bug → 连接池无效 → 日志开销 → 客户端 GIL → 行锁竞争）完整记录在 [docs/压测报告.md](docs/压测报告.md)。
 
 ```bash
-python scripts/benchmark.py -c 32 -n 500
+python scripts/benchmark.py -c 32 -n 500          # 读 + 写 + 超卖
+python scripts/benchmark.py --scenario oversell   # 只验证超卖
 ```
 
 ---
@@ -233,25 +256,28 @@ python scripts/benchmark.py -c 32 -n 500
 Jack项目/
 ├── backend/
 │   ├── pom.xml
-│   └── src/main/
-│       ├── java/com/jack/jianxuan/
-│       │   ├── annotation/      @AdminOnly
-│       │   ├── common/          Result / BusinessException / GlobalExceptionHandler / UserContext
-│       │   ├── config/          MyBatis-Plus 分页、BCrypt、拦截器注册、OpenAPI
-│       │   ├── controller/      用户端与管理端接口
-│       │   ├── dto/             请求 DTO 与响应 VO
-│       │   ├── entity/          6 张表的实体
-│       │   ├── interceptor/     JWT 验签 + 角色校验
-│       │   ├── mapper/          MyBatis-Plus Mapper
-│       │   ├── service/         业务逻辑与事务
-│       │   └── util/            JwtUtil
-│       └── resources/
-│           ├── application.yml              主配置（口令/密钥为环境变量占位符）
-│           ├── application-local.yml.example 本地配置模板（复制为 .yml 后填真实值）
-│           └── sql/             01-06 建表与种子数据
+│   ├── src/main/
+│   │   ├── java/com/jack/jianxuan/
+│   │   │   ├── annotation/      @AdminOnly
+│   │   │   ├── common/          Result / BusinessException / GlobalExceptionHandler / UserContext
+│   │   │   ├── config/          MyBatis-Plus 分页、BCrypt、拦截器注册、OpenAPI
+│   │   │   ├── controller/      用户端与管理端接口
+│   │   │   ├── dto/             请求 DTO 与响应 VO
+│   │   │   ├── entity/          6 张表的实体
+│   │   │   ├── interceptor/     JWT 验签 + 角色校验
+│   │   │   ├── mapper/          MyBatis-Plus Mapper
+│   │   │   ├── service/         业务逻辑与事务
+│   │   │   └── util/            JwtUtil
+│   │   └── resources/
+│   │       ├── application.yml               主配置（口令/密钥为环境变量占位符）
+│   │       ├── application-local.yml.example 本地配置模板（复制为 .yml 后填真实值）
+│   │       └── sql/             01-06 建表与种子数据
+│   └── src/test/java/com/jack/jianxuan/service/   OrderServiceTest（下单 / 取消集成测试）
 ├── frontend/                    Vue 3 前端
 ├── docs/                        各模块代码讲解、环境配置、API 文档、压测报告
-└── scripts/benchmark.py         压测脚本
+└── scripts/
+    ├── benchmark.py             压测脚本（读 / 写 / 超卖三个场景）
+    └── cleanup_bench.sql        清理压测产生的订单与商品
 ```
 
 `docs/` 里有每个模块的详细讲解（M0-M5），包含设计取舍、踩过的坑和面试自测题：
@@ -285,4 +311,5 @@ const MOCK_ORDER = false
 - **没有真实支付**：下单即算「待发货」，没有支付网关
 - **没有 Redis / MQ**：热点行锁的优化手段（库存分桶、预扣、队列削峰）都没做，原因见压测报告
 - **单机部署**：雪花 ID 的机器号由 MyBatis-Plus 自动推导，多实例部署需要显式配置 workerId
-- **无自动化测试**：验证靠 `curl` / 脚本实测，没有写 JUnit
+- **测试覆盖有限**：只有订单模块的 5 个集成测试（下单扣减、库存不足、取消回补、重复取消、软删商品仍回补），其余靠 `curl` 手工验证。
+  并发超卖没法用 JUnit 覆盖——测试事务里看不到其他线程未提交的数据，所以那部分由 `benchmark.py --scenario oversell` 承担
