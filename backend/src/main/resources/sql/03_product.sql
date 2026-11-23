@@ -1,7 +1,7 @@
 -- =============================================================
 -- M2-1 商品模块建表：category（分类） + product（商品）
 -- 执行方式必须带字符集参数，否则中文会变成 ????
---   mysql -umall -pREDACTED jianxuan_mall --default-character-set=utf8mb4 < 03_product.sql
+--   mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < src/main/resources/sql/03_product.sql
 -- =============================================================
 
 USE jianxuan_mall;

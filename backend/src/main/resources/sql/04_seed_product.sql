@@ -1,7 +1,7 @@
 -- =============================================================
 -- M2-1 商品模块种子数据：5 个分类 + 16 个商品
 -- 数据与前端 mock 完全对齐，方便切换后肉眼比对结果是否一致
---   mysql -umall -pREDACTED jianxuan_mall --default-character-set=utf8mb4 < 04_seed_product.sql
+--   mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < src/main/resources/sql/04_seed_product.sql
 -- =============================================================
 
 USE jianxuan_mall;

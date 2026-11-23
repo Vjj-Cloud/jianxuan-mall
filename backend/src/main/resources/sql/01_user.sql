@@ -1,6 +1,8 @@
 -- ============================================================
 -- M1 · 用户表
--- 执行方式：mysql -umall -p jianxuan_mall < sql/01_user.sql
+-- 执行方式（在 backend 目录下）：
+--   mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 \
+--     < src/main/resources/sql/01_user.sql
 -- ============================================================
 
 CREATE TABLE IF NOT EXISTS `user` (

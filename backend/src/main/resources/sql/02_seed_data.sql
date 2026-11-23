@@ -3,6 +3,9 @@
 -- 对应前端登录页的「演示账号」，让 clone 下来的项目开箱即可登录
 -- 密码均为 BCrypt 哈希（cost=10），明文见注释
 -- 可重复执行：已存在则更新密码与角色
+-- 执行方式（在 backend 目录下）：
+--   mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 \
+--     < src/main/resources/sql/02_seed_data.sql
 -- ============================================================
 
 USE jianxuan_mall;

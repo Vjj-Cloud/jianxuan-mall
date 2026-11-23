@@ -1,6 +1,6 @@
 -- =============================================================
 -- M3 购物车：cart_item 表
---   mysql -umall -pREDACTED jianxuan_mall --default-character-set=utf8mb4 < 05_cart.sql
+--   mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < src/main/resources/sql/05_cart.sql
 -- =============================================================
 
 USE jianxuan_mall;
