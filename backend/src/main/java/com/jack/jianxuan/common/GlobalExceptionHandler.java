@@ -3,6 +3,8 @@ package com.jack.jianxuan.common;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -34,9 +36,34 @@ public class GlobalExceptionHandler {
         return build(404, "接口不存在");
     }
 
+    /**
+     * HTTP 方法用错（比如取消订单写成 PUT，实际接口只收 POST）。
+     *
+     * 这类异常以前会一路掉进下面的 Exception 兜底变成 500「系统繁忙」，
+     * 把「客户端调错了」伪装成「服务端炸了」——排查时得翻日志才知道真相。
+     * 405 是协议层面的正确答案，前端看到就能立刻定位。
+     */
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<Result<Void>> handleMethodNotSupported(HttpRequestMethodNotSupportedException e) {
+        log.warn("请求方法不支持: method={}, 支持的方法={}", e.getMethod(), e.getSupportedHttpMethods());
+        return build(405, "请求方法 " + e.getMethod() + " 不受支持，该接口支持 " + e.getSupportedHttpMethods());
+    }
+
+    /**
+     * 请求体缺失或 JSON 格式错误（少括号、字段类型对不上、body 为空）。
+     * 同样属于调用方问题，应该是 400 而不是 500。
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Result<Void>> handleMessageNotReadable(HttpMessageNotReadableException e) {
+        log.warn("请求体解析失败: {}", e.getMessage());
+        return build(400, "请求体格式错误，请检查 JSON 结构与字段类型");
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Result<Void>> handleException(Exception e) {
-        log.error("未捕获异常", e);
+        // 走到这里说明不是已知的调用方错误，而是真的没预料到的问题。
+        // 加上异常类型，日志里一眼能分辨是新 bug 还是被漏处理的框架异常。
+        log.error("未捕获异常: {}", e.getClass().getName(), e);
         return build(500, "系统繁忙，请稍后重试");
     }
 

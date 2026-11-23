@@ -44,12 +44,23 @@ public class JwtInterceptor implements HandlerInterceptor {
             throw new BusinessException(401, "登录凭证无效，请重新登录");
         }
 
-        UserContext.set(Long.valueOf(claims.getSubject()), claims.get("role", String.class));
+        String role = claims.get("role", String.class);
 
-        // 权限校验放在最后：先确认「你是谁」，再判断「你能不能进」
-        if (needAdmin(handler) && !"ADMIN".equals(UserContext.getRole())) {
+        // 权限校验必须放在 UserContext.set() 之前。
+        //
+        // 原因：Spring MVC 只有在 preHandle 返回 true 之后，才会把 afterCompletion
+        // 登记到本次请求的回调链上。preHandle 里抛异常 → afterCompletion 不会被调用
+        // → 第 47 行 set 进去的 userId/role 会残留在 Tomcat 工作线程上。
+        // 而 Tomcat 线程是复用的，下一个请求进来时如果没有任何地方重新 set，
+        // UserContext.getRole() 就会读到上一个请求的 ADMIN —— 属于越权隐患。
+        //
+        // 与其「先污染再清理」，不如让污染根本不发生：校验不过就直接抛，
+        // 此时 ThreadLocal 一个字都没写过，也就不需要依赖任何清理动作兜底。
+        if (needAdmin(handler) && !"ADMIN".equals(role)) {
             throw new BusinessException(403, "没有权限");
         }
+
+        UserContext.set(Long.valueOf(claims.getSubject()), role);
         return true;
     }
 

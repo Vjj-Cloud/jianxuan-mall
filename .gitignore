@@ -21,6 +21,10 @@ dist-ssr/
 logs/
 *.local
 
+# ===== 本地配置（数据库口令、JWT 密钥）=====
+# 提交其上模板 application-local.yml.example，真实值留在这份文件里
+application-local.yml
+
 # ===== AI 工具工作目录（项目记忆、会话数据，不属于源码）=====
 .workbuddy/
 
