@@ -1,0 +1,29 @@
+# ===== 大目录：绝对不能进版本库 =====
+# Maven 本地仓库（95M）
+cangku/
+# 前端依赖（146M）
+node_modules/
+# 构建产物
+target/
+dist/
+dist-ssr/
+
+# ===== IDE =====
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+!.vscode/extensions.json
+
+# ===== 日志与临时文件 =====
+*.log
+logs/
+*.local
+
+# ===== AI 工具工作目录（项目记忆、会话数据，不属于源码）=====
+.workbuddy/
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db

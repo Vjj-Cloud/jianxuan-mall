@@ -1,0 +1,57 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --brand-color: #409eff;
+  --price-color: #f56c6c;
+  --page-bg: #f5f6f8;
+  --card-bg: #ffffff;
+  --text-main: #303133;
+  --text-sub: #909399;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background: var(--page-bg);
+  color: var(--text-main);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+.page-wrap {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px 16px 40px;
+}
+
+.price {
+  color: var(--price-color);
+  font-weight: 600;
+}
+
+.ellipsis-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.section-title {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 8px 0 16px;
+}
+
+.empty-block {
+  padding: 60px 0;
+  text-align: center;
+  color: var(--text-sub);
+}
