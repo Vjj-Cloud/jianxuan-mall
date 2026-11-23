@@ -99,7 +99,8 @@ class OrderTimeoutTaskTest {
 
         // 3 号失败不该拖累 4 号
         verify(orderService).cancelBySystem(4L);
-        verify(delayQueue).clearRetry(4L);
+        // 处理成功要把「重试计数 + 死信记录」一起清掉，否则死信集合会积压已解决的订单
+        verify(delayQueue).clearHandled(4L);
     }
 
     @Test

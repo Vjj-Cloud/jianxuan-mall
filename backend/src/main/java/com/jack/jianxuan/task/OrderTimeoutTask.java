@@ -103,9 +103,9 @@ public class OrderTimeoutTask implements ApplicationRunner {
                 if (cancelled) {
                     log.info("订单 {} 超时未支付，已自动取消", orderId);
                 }
-                // 无论「真取消了」还是「状态已变、无需取消」，这条任务都算处理完了，清掉计数。
-                // 清理失败不影响业务，最多让这个订单多消耗一次重试配额。
-                clearRetryQuietly(orderId);
+                // 无论「真取消了」还是「状态已变、无需取消」，这条任务都算处理完了，
+                // 清掉重试计数和可能残留的死信记录。清理失败不影响业务，最多让这个订单多消耗一次重试配额。
+                clearHandledQuietly(orderId);
             } catch (Exception e) {
                 requeue(orderId, e);
             }
@@ -137,11 +137,11 @@ public class OrderTimeoutTask implements ApplicationRunner {
         }
     }
 
-    private void clearRetryQuietly(Long orderId) {
+    private void clearHandledQuietly(Long orderId) {
         try {
-            delayQueue.clearRetry(orderId);
+            delayQueue.clearHandled(orderId);
         } catch (Exception e) {
-            log.debug("清理订单 {} 的重试计数失败", orderId, e);
+            log.debug("清理订单 {} 的队列痕迹失败", orderId, e);
         }
     }
 

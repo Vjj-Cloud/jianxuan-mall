@@ -129,13 +129,23 @@ public class OrderDelayQueue {
     }
 
     /**
-     * 成功处理后清掉重试计数。
+     * 成功处理后清掉这个订单在队列体系里留下的痕迹：重试计数 + 死信记录。
      *
-     * <p>不清理的话，同一个订单 id 的计数会一直留着：这次重试了 2 次成功，
+     * <p>不清理重试计数的话，同一个订单 id 的计数会一直留着：这次重试了 2 次成功，
      * 下次（哪怕是完全无关的另一轮补灌）只要再失败一次就到上限了，等于提前消耗了配额。
+     *
+     * <p>死信记录也要一起清，这一点容易被忽略：订单进过死信之后，重启补灌会把所有
+     * PENDING 订单重新入队，一旦这一轮取消成功，这笔订单就彻底结束了——但死信集合里
+     * 那条记录不会自己消失。久而久之 {@code order:delay:dead} 里会混进一堆「其实早就
+     * 处理好了」的订单，人工排查时得先去库里逐条核对状态。
+     *
+     * <p>换句话讲：死信要有人看，前提是它里面每一条都真的还需要看。只写入不清理，
+     * 这个集合就从「待办清单」退化成「历史日志」——那它的存在就没有意义了。
      */
-    public void clearRetry(Long orderId) {
-        redisTemplate.opsForHash().delete(RETRY_KEY, String.valueOf(orderId));
+    public void clearHandled(Long orderId) {
+        String member = String.valueOf(orderId);
+        redisTemplate.opsForHash().delete(RETRY_KEY, member);
+        redisTemplate.opsForZSet().remove(DEAD_KEY, member);
     }
 
     /** 死信集合大小，用于排查和验证。 */
