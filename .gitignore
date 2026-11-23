@@ -25,6 +25,10 @@ logs/
 __pycache__/
 *.pyc
 
+# ===== 数据库快照 =====
+# 含真实数据与测试账号密码哈希，属于运行时数据而非源码，不进版本库
+db/*.sql
+
 # ===== 本地配置（数据库口令、JWT 密钥）=====
 # 提交其上模板 application-local.yml.example，真实值留在这份文件里
 application-local.yml
