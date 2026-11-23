@@ -118,6 +118,10 @@ public class OrderService {
         order.setUserId(userId);
         order.setTotalAmount(totalAmount);
         order.setStatus(PENDING);
+        // 幂等键落库。它和 user_id 组成唯一索引 uk_user_request：
+        // 万一 Redis 那层没拦住，这里的 INSERT 会直接撞唯一索引失败，整个事务回滚，
+        // 库存也跟着还原，不会出现「两笔订单扣了两次库存」。
+        order.setRequestId(request.getRequestId());
         order.setReceiverName(request.getReceiverName());
         order.setReceiverPhone(request.getReceiverPhone());
         order.setReceiverAddress(request.getReceiverAddress());

@@ -6,6 +6,7 @@ import com.jack.jianxuan.dto.OrderCreateRequest;
 import com.jack.jianxuan.dto.OrderQuery;
 import com.jack.jianxuan.dto.OrderVO;
 import com.jack.jianxuan.dto.PageResult;
+import com.jack.jianxuan.service.OrderCreateGuard;
 import com.jack.jianxuan.service.OrderService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -28,10 +29,15 @@ import org.springframework.web.bind.annotation.RestController;
 public class OrderController {
 
     private final OrderService orderService;
+    private final OrderCreateGuard orderCreateGuard;
 
+    /**
+     * 下单。走 {@link OrderCreateGuard} 而不是直接调 OrderService，
+     * 由它负责幂等：同一个 requestId 重复提交只会产生一笔订单。
+     */
     @PostMapping
     public Result<OrderVO> create(@RequestBody @Valid OrderCreateRequest request) {
-        return Result.ok(orderService.create(UserContext.getUserId(), request));
+        return Result.ok(orderCreateGuard.create(UserContext.getUserId(), request));
     }
 
     @GetMapping

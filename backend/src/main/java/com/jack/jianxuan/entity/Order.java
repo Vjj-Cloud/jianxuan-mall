@@ -27,6 +27,13 @@ public class Order {
     private BigDecimal totalAmount;
     /** PENDING / SHIPPED / COMPLETED / CANCELLED */
     private String status;
+    /**
+     * 客户端幂等键。同一次「购买意图」在重试时保持不变。
+     *
+     * <p>和 {@code userId} 一起组成唯一索引 {@code uk_user_request}，
+     * 是「重复提交只落一行」的最后一道保证——应用层的 Redis 拦截失效时靠它兜底。
+     */
+    private String requestId;
     private String receiverName;
     private String receiverPhone;
     private String receiverAddress;

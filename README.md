@@ -33,7 +33,7 @@
 | 认证 | 注册、登录、获取当前用户 |
 | 商品 | 分类列表、商品分页（关键字 / 分类 / 价格销量排序）、商品详情 |
 | 购物车 | 列表、加入（重复商品自动累加）、改数量、删条目、清空 |
-| 订单 | 下单、列表（按状态筛选）、详情、取消、确认收货、**超时未支付自动取消** |
+| 订单 | 下单（`requestId` 幂等，重复提交只生成一笔）、列表（按状态筛选）、详情、取消、确认收货、**超时未支付自动取消** |
 
 ### 管理端（`@AdminOnly`）
 
@@ -56,16 +56,22 @@ flowchart LR
     subgraph server["Spring Boot :8080"]
         I["JwtInterceptor<br/>验签 + 写入 UserContext<br/>@AdminOnly 校验角色"]
         C["Controller<br/>24 个业务接口"]
+        G["OrderCreateGuard<br/>下单幂等<br/>SETNX 拦截 + 唯一索引兜底"]
         S["Service<br/>事务边界"]
         M["Mapper<br/>MyBatis-Plus"]
         T["OrderTimeoutTask<br/>@Scheduled 每秒轮询"]
     end
 
-    DB[("MySQL 8<br/>6 张表")]
-    R[("Redis<br/>商品缓存 + order:delay")]
+    DB[("MySQL 8<br/>6 张表<br/>uk_user_request")] 
+    R[("Redis<br/>商品缓存 + order:delay + order:idem")]
 
     V -->|"HTTP /api/**<br/>Authorization: Bearer"| I
-    I --> C --> S --> M --> DB
+    I --> C
+    C -->|"POST /orders"| G
+    G -->|"幂等通过后进入事务"| S
+    C -->|"其余接口"| S
+    S --> M --> DB
+    G -->|"SETNX 占位 / 回放结果"| R
     S -->|"商品详情 Cache-Aside"| R
     S -->|"事务提交后 ZADD"| R
     T -->|"Lua 原子取出到期任务"| R
@@ -99,7 +105,8 @@ mysql -u root -p -e "CREATE USER IF NOT EXISTS 'mall'@'localhost' IDENTIFIED BY 
 
 ```bash
 cd backend/src/main/resources/sql
-for f in 01_user.sql 02_seed_data.sql 03_product.sql 04_seed_product.sql 05_cart.sql 06_order.sql; do
+# 01-06 建表与种子数据，07 是增量脚本（加幂等列 + 唯一索引），全新库和已有库都要跑
+for f in 01_user.sql 02_seed_data.sql 03_product.sql 04_seed_product.sql 05_cart.sql 06_order.sql 07_order_idempotent.sql; do
   mysql -umall -p jianxuan_mall --default-character-set=utf8mb4 < "$f"
 done
 ```
@@ -243,6 +250,9 @@ update().eq(id, orderId).eq(status, PENDING).set(status, SHIPPED)
 
 两个管理员同时点发货，第二个命中 0 行直接报错，`shipped_at` 不会被覆盖。取消、确认收货同理。
 
+> 注意它防的是「同一张订单被改两次状态」，防不住「同一个购买意图生成两笔订单」——
+> 后者是幂等问题，见下方第 8 节。这两件事经常被混为一谈。
+
 ```
 PENDING ──发货──> SHIPPED ──确认收货──> COMPLETED
    └──取消──> CANCELLED（取消后不能再发货）
@@ -328,6 +338,36 @@ return jobs
 
 设计细节与 12 道面试题见 [docs/M8-商品缓存.md](docs/M8-商品缓存.md)。
 
+### 8. 下单幂等：Redis 拦截 + 唯一索引兜底
+
+「防超卖」和「幂等」是两个问题。前者保证不卖超，后者保证**一次购买意图只落一笔订单**。
+用户手抖点两次、或前端 15 秒超时后自动重试（更隐蔽，用户完全无感知），都会变成两笔订单、
+扣两次库存。
+
+客户端在结算页生成一个 `requestId`（`crypto.randomUUID()`），重试时保持不变。服务端：
+
+1. **Redis `SETNX` 占位**（`order:idem:{userId}:{requestId}`，TTL 30s）。抢不到说明是重复请求，
+   直接回放上次结果——**连事务都不开，一行 SQL 都不执行**。
+2. **数据库唯一索引 `uk_user_request (user_id, request_id)`**。Redis 挂了、key 过期了、
+   并发刚好穿过 SETNX，都拦不住，但两笔请求带同一个 requestId 最多只能落一行。
+
+值有两态：`PROCESSING`（首次还在跑，重复请求返回 409「请勿重复提交」）→ 订单 ID
+（已完成，直接返回同一笔订单，200）。**失败必须释放幂等键**，否则用户买多了被拒后，
+改数量再提交会被自己的失败请求挡住 30 秒。
+
+两个容易踩的坑：
+
+- **兜底 `catch (DuplicateKeyException)` 必须在事务外层。** `@Transactional` 方法内捕获后继续
+  查库，方法返回时提交会抛 `UnexpectedRollbackException`；而且同一个类自我调用不走代理，
+  `@Transactional` 会静默失效。所以幂等逻辑独立成 `OrderCreateGuard`。
+- **加唯一索引前必须回填历史数据。** `request_id NOT NULL DEFAULT ''`，不回填的话
+  `(user_id, '')` 立刻冲突，同一用户只能留一张历史订单。
+
+实测：同一 requestId 连提 3 次返回同一订单号、库存只扣一次；10 并发全部 200 且只有一笔订单；
+**把 Redis 整个停掉再提两次，第二次仍返回同一笔订单**（走唯一索引兜底）。
+
+设计细节与 9 道面试题见 [docs/M9-下单幂等.md](docs/M9-下单幂等.md)。
+
 ---
 
 ## 压测结果
@@ -367,13 +407,13 @@ Jack项目/
 │   │   │   ├── entity/          6 张表的实体
 │   │   │   ├── interceptor/     JWT 验签 + 角色校验
 │   │   │   ├── mapper/          MyBatis-Plus Mapper
-│   │   │   ├── service/         业务逻辑与事务（OrderDelayQueue 延迟队列、ProductCache 商品缓存）
+│   │   │   ├── service/         业务逻辑与事务（OrderCreateGuard 幂等、OrderDelayQueue 延迟队列、ProductCache 商品缓存）
 │   │   │   ├── task/            OrderTimeoutTask（超时扫描 + 启动补灌）
 │   │   │   └── util/            JwtUtil
 │   │   └── resources/
 │   │       ├── application.yml               主配置（口令/密钥为环境变量占位符）
 │   │       ├── application-local.yml.example 本地配置模板（复制为 .yml 后填真实值）
-│   │       └── sql/             01-06 建表与种子数据
+│   │       └── sql/             01-06 建表与种子数据，07 为幂等增量脚本
 │   └── src/test/java/com/jack/jianxuan/service/   OrderServiceTest（下单 / 取消集成测试）
 ├── frontend/                    Vue 3 前端
 ├── docs/                        各模块代码讲解、环境配置、API 文档、压测报告
@@ -382,7 +422,7 @@ Jack项目/
     └── cleanup_bench.sql        清理压测产生的订单与商品
 ```
 
-`docs/` 里有每个模块的详细讲解（M0-M8），包含设计取舍、踩过的坑和面试自测题：
+`docs/` 里有每个模块的详细讲解（M0-M9），包含设计取舍、踩过的坑和面试自测题：
 
 | 文档 | 内容 |
 |---|---|
@@ -391,6 +431,7 @@ Jack项目/
 | [M0-M5 代码讲解](docs/) | 统一返回体、JWT、商品、购物车、订单、管理端 |
 | [M7-订单超时取消.md](docs/M7-订单超时取消.md) | ZSet 延迟队列的设计取舍与实测 |
 | [M8-商品缓存.md](docs/M8-商品缓存.md) | Cache-Aside、穿透/击穿/雪崩、降级熔断、12 道面试题 |
+| [M9-下单幂等.md](docs/M9-下单幂等.md) | 两层幂等、事务边界的坑、9 道面试题 |
 | [压测报告.md](docs/压测报告.md) | 压测数据与瓶颈排查全过程 |
 
 ---
@@ -413,7 +454,11 @@ const MOCK_ORDER = false
 ## 已知限制
 
 - **没有真实支付**：下单即算「待发货」，没有支付网关，所以超时取消的依据是「30 分钟未发货」
-- **Redis 用在缓存和延迟队列两处**：热点行锁的优化手段（库存分桶、预扣、队列削峰）都没做，原因见压测报告
+- **Redis 用在三处**：商品缓存、延迟队列、下单幂等键。热点行锁的优化手段（库存分桶、预扣、队列削峰）都没做，原因见压测报告
+- **幂等键不做过期后的语义保证**：`requestId` 在 Redis 里存 24 小时，超期后同一个 ID 理论上能再下一单
+  （唯一索引也只约束到那时为止）。实际客户端每天都会生成新的 UUID，不会触发
+- **没有防刷单限流**：幂等只保证「同一个请求不重复」，挡不住「每次换一个 requestId 高频下单」。
+  那是限流/风控的职责，本项目没做
 - **缓存删除失败只靠 TTL 兜底**：改商品时删缓存失败只记日志，最多脏 30 分钟。
   彻底解决要靠删缓存重试队列或订阅 binlog（Canal），本项目没上
 - **延迟任务没有重试上限**：`OrderTimeoutTask` 里处理失败会隔 60 秒重新入队，异常数据会一直重试。

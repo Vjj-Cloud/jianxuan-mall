@@ -17,6 +17,23 @@ const submitting = ref(false)
 const formRef = ref()
 const form = reactive({ receiverName: '', receiverPhone: '', receiverAddress: '' })
 
+/**
+ * 幂等键：进入结算页时生成一次，整个页面生命周期内不变。
+ *
+ * 「手抖点两次」和「请求超时后重试」带的都是同一个值，后端据此判断为同一次购买意图，
+ * 只会产生一笔订单。每次进入结算页是新的一次购买意图，所以重新生成。
+ */
+const requestId = ref('')
+
+function genRequestId() {
+  // crypto.randomUUID 只在安全上下文（https / localhost）可用。
+  // 打包部署到普通 http 域名时它会消失，必须有降级实现，否则整个下单流程直接报错。
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID()
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+}
+
 const rules = {
   receiverName: [{ required: true, message: '请输入收货人姓名', trigger: 'blur' }],
   receiverPhone: [
@@ -33,6 +50,7 @@ const totalAmount = computed(() =>
 const totalCount = computed(() => items.value.reduce((sum, i) => sum + i.quantity, 0))
 
 onMounted(async () => {
+  requestId.value = genRequestId()
   try {
     if (route.query.itemIds) {
       await cartStore.load()
@@ -68,13 +86,22 @@ onMounted(async () => {
 })
 
 async function submit() {
+  // 前端第一道：按钮 loading 之外的兜底，挡住同一个页面内的连点。
+  // 真正跨页面、跨设备、跨进程的重复，靠的是 requestId + 后端幂等。
+  if (submitting.value) return
   await formRef.value.validate()
   submitting.value = true
   try {
     await createOrder({
+      // 幂等键由前端生成并随请求带上。失败重试时保持不变，
+      // 后端才能把「重复提交」和「真的想下两单」区分开。
+      requestId: requestId.value,
       items: items.value.map((i) => ({ productId: i.productId, quantity: i.quantity })),
       ...form,
     })
+    // 这一单已经完成，换一个新的幂等键：
+    // 用户若退回本页再提交，那是一次新的购买意图，不该被当成重复请求。
+    requestId.value = genRequestId()
     await cartStore.load()
     ElMessage.success('下单成功')
     router.replace({ path: '/orders', query: { created: 1 } })
