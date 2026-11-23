@@ -19,8 +19,11 @@ import com.jack.jianxuan.mapper.OrderItemMapper;
 import com.jack.jianxuan.mapper.OrderMapper;
 import com.jack.jianxuan.mapper.ProductMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
@@ -31,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class OrderService {
@@ -45,6 +49,7 @@ public class OrderService {
     private final OrderItemMapper orderItemMapper;
     private final ProductMapper productMapper;
     private final CartItemMapper cartItemMapper;
+    private final OrderDelayQueue orderDelayQueue;
 
     /**
      * 创建订单。
@@ -136,7 +141,68 @@ public class OrderService {
                 .eq(CartItem::getUserId, userId)
                 .in(CartItem::getProductId, productIds));
 
+        // 8. 投递「超时未支付自动取消」的延迟任务。
+        //
+        //    必须等事务提交之后再投递，不能在方法体里直接 push：
+        //    本方法带 @Transactional，事务提交之前 Redis 就已经有任务了。如果后面任何一步
+        //    抛异常导致回滚（比如上面清购物车失败），订单根本没进库，但延迟任务还在，
+        //    到点就会去取消一个不存在的订单——队列和数据库出现不一致。
+        //
+        //    afterCommit 只在事务真正提交成功后回调，回滚时不会执行，天然对齐。
+        Long createdOrderId = order.getId();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                orderDelayQueue.pushAfterTimeout(createdOrderId);
+            }
+        });
+
         return OrderVO.from(order, orderItems);
+    }
+
+    /**
+     * 系统自动取消：订单超时未支付时由 {@code OrderTimeoutTask} 调用。
+     *
+     * <p>为什么不直接复用 {@link #cancel(Long, Long)}：那个方法的第一个参数是 userId，
+     * 查询条件里带 {@code eq(user_id)}，而系统任务没有「当前用户」。硬塞一个 userId 进去
+     * 要么查不到订单，要么得先查一次再传，绕。
+     *
+     * <p>和 {@code cancel} 最大的区别在返回值和异常处理：{@code cancel} 面向用户，
+     * 状态不对就该抛异常让他刷新页面；这里面向后台，状态变了说明「本来就不该取消」
+     * （用户已付款、已发货、或已手动取消），是预期内的正常分支，不能抛异常——
+     * 否则日志里全是「取消失败」，真正的故障反而被淹掉。
+     *
+     * @return true 表示这次确实取消了，false 表示状态已变或订单不存在
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public boolean cancelBySystem(Long orderId) {
+        Order order = orderMapper.selectById(orderId);
+        if (order == null) {
+            log.warn("自动取消订单 {}：订单不存在，跳过", orderId);
+            return false;
+        }
+        if (!PENDING.equals(order.getStatus())) {
+            log.info("自动取消订单 {}：当前状态为 {}，无需取消", orderId, order.getStatus());
+            return false;
+        }
+
+        // 条件更新：只有仍是 PENDING 才改成 CANCELLED。
+        // 这里和用户手动取消抢的是同一把行锁，谁先到谁生效，后者影响 0 行。
+        int rows = orderMapper.update(null, new LambdaUpdateWrapper<Order>()
+                .eq(Order::getId, orderId)
+                .eq(Order::getStatus, PENDING)
+                .set(Order::getStatus, CANCELLED)
+                .set(Order::getUpdatedAt, LocalDateTime.now()));
+        if (rows == 0) {
+            log.info("自动取消订单 {}：状态已被其他操作变更，跳过", orderId);
+            return false;
+        }
+
+        List<OrderItem> items = loadItems(List.of(orderId)).getOrDefault(orderId, List.of());
+        for (OrderItem item : items) {
+            productMapper.restoreStock(item.getProductId(), item.getQuantity());
+        }
+        return true;
     }
 
     /** 用户端：只看自己的订单 */

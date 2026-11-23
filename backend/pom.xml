@@ -84,6 +84,12 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- Redis：延迟队列（订单超时取消）用，后续商品缓存也复用同一套连接 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
         <!-- BCrypt：只引 crypto 模块，不引整套 Spring Security -->
         <dependency>
             <groupId>org.springframework.security</groupId>

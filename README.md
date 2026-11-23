@@ -15,6 +15,7 @@
 | 后端框架 | Spring Boot 3.5.16 / JDK 17 | 主流组合，Jakarta 命名空间 |
 | 持久层 | MyBatis-Plus 3.5.18 | 单表 CRUD 免写 XML，复杂查询仍可直接写 SQL |
 | 数据库 | MySQL 8 | 事务 + 行锁，防超卖要靠它 |
+| 缓存 / 延迟队列 | Redis 5+ | 订单超时取消用 ZSet 延迟队列；后续商品缓存复用同一套连接 |
 | 认证 | JWT（jjwt 0.12.6）+ BCrypt | 无状态，前后端分离友好 |
 | 接口文档 | springdoc-openapi 2.8.9 | Swagger UI 可直接填 token 调试 |
 | 前端 | Vue 3 + Vite + Element Plus + Pinia | 组合式 API，开发体验好 |
@@ -32,7 +33,7 @@
 | 认证 | 注册、登录、获取当前用户 |
 | 商品 | 分类列表、商品分页（关键字 / 分类 / 价格销量排序）、商品详情 |
 | 购物车 | 列表、加入（重复商品自动累加）、改数量、删条目、清空 |
-| 订单 | 下单、列表（按状态筛选）、详情、取消、确认收货 |
+| 订单 | 下单、列表（按状态筛选）、详情、取消、确认收货、**超时未支付自动取消** |
 
 ### 管理端（`@AdminOnly`）
 
@@ -57,12 +58,17 @@ flowchart LR
         C["Controller<br/>24 个业务接口"]
         S["Service<br/>事务边界"]
         M["Mapper<br/>MyBatis-Plus"]
+        T["OrderTimeoutTask<br/>@Scheduled 每秒轮询"]
     end
 
     DB[("MySQL 8<br/>6 张表")]
+    R[("Redis<br/>order:delay（ZSet）")]
 
     V -->|"HTTP /api/**<br/>Authorization: Bearer"| I
     I --> C --> S --> M --> DB
+    S -->|"事务提交后 ZADD"| R
+    T -->|"Lua 原子取出到期任务"| R
+    T -->|"调用 cancelBySystem"| S
 ```
 
 请求进来先过 `JwtInterceptor`：验签通过后把 `userId` / `role` 写进 `ThreadLocal`，业务代码通过 `UserContext` 取当前用户，**任何接口都不接受前端传的 userId**——那是越权的入口。
@@ -76,6 +82,7 @@ flowchart LR
 - JDK 17
 - Maven 3.9.x（3.10+ 与 IDEA 2024.3 的内嵌 Maven 不兼容，别用）
 - MySQL 8
+- **Redis 5+**（订单超时取消用；没启动的话后端能起来，但下单会报错）
 - Node.js 18+
 
 ### 1. 建库并初始化
@@ -122,10 +129,23 @@ cp application-local.yml.example application-local.yml
 
 `application.yml` 里这两项是 `${DB_PASSWORD}` / `${JWT_SECRET}`，**故意不设默认值**。缺配置时会启动失败并提示 `Could not resolve placeholder` —— 这是有意的：让「没配对」立刻暴露，而不是带着一个默认弱口令静默跑起来。
 
+**Redis 已注册为 Windows 服务**（服务名 `Redis`，开机自启，AOF 持久化已开启），正常开机就在跑，不用手动启动。确认一下即可：
+
 ```bash
+net start Redis                       # 已在运行时提示「服务已经启动」
+D:/redis/redis-cli.exe ping           # 返回 PONG 就行
+```
+
+没装 Redis 的机器见 [`docs/环境配置.md`](docs/环境配置.md) 第 6 节。
+
+```bash
+# 另开一个终端启动后端
 cd backend
 mvn spring-boot:run
 ```
+
+> 测试超时取消时不必真等 30 分钟：`mvn spring-boot:run -Dspring-boot.run.arguments=--order.timeout-minutes=0.2`
+> 会把超时改成 12 秒。
 
 - 接口：http://localhost:8080/api/ping
 - **接口文档**：http://localhost:8080/swagger-ui.html ← 点 Authorize 填 token 可直接调
@@ -225,7 +245,42 @@ update().eq(id, orderId).eq(status, PENDING).set(status, SHIPPED)
 ```
 PENDING ──发货──> SHIPPED ──确认收货──> COMPLETED
    └──取消──> CANCELLED（取消后不能再发货）
+   └──超时30分钟──> CANCELLED（延迟队列触发，见下）
 ```
+
+### 6. 订单超时取消：ZSet 延迟队列，不是定时扫表
+
+下单成功后往 Redis 的 ZSet 里塞一条任务，`member = orderId`、`score = 到期时间戳`。
+调度线程每秒取一次「score ≤ 现在」的任务，取到就调 `cancelBySystem`。
+
+**为什么不用 `@Scheduled` 扫订单表**：扫表要全表扫 `PENDING`，订单量一大就扫不动，精度还受扫描间隔限制。
+队列只处理「刚好到期的那几个」，代价是 O(log N + M)。
+
+取任务用 Lua 脚本一次完成「查 + 删」，因为 Redis 执行 Lua 是单线程原子的：
+
+```lua
+local jobs = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+if #jobs == 0 then return {} end
+redis.call('ZREM', KEYS[1], unpack(jobs))
+return jobs
+```
+
+如果拆成两次调用，两个调度线程会读到同一批 orderId，同一个订单被取消两次、库存回补两遍。
+
+三个容易踩的点：
+
+| 坑 | 表现 | 解法 |
+|---|---|---|
+| 在事务里 push | 事务回滚了，Redis 里任务还在，到点去取消不存在的订单 | 挂在 `TransactionSynchronization.afterCommit` 上，只在提交成功后投递 |
+| 取任务不用 Lua | 并发下同一订单被处理两次 | 查询和删除放在同一个脚本里，中间插不进别的命令 |
+| `rows == 0` 就抛异常 | 用户已付款/已发货时，日志里全是「取消失败」，真故障被淹掉 | 系统任务里状态变更属于正常分支，记 info 后跳过 |
+
+已发货的订单不会被误取消——`cancelBySystem` 里的条件更新是 `eq(status, PENDING)`，
+发货之后命中 0 行直接返回。实测：下单后立刻 `PUT` 发货，等超时任务跑到，状态保持 `SHIPPED`、库存不回补。
+
+**可靠性兜底**：Redis 挂了或数据丢了，队列就是空的，那些订单永远等不到取消。
+所以应用启动时会把库里所有 `PENDING` 订单重新灌一遍队列（`ZADD` 对同 member 是覆盖语义，幂等）。
+队列只是把「多久之后被发现」从小时级缩到秒级，正确性最终不依赖它。
 
 ---
 
@@ -266,7 +321,8 @@ Jack项目/
 │   │   │   ├── entity/          6 张表的实体
 │   │   │   ├── interceptor/     JWT 验签 + 角色校验
 │   │   │   ├── mapper/          MyBatis-Plus Mapper
-│   │   │   ├── service/         业务逻辑与事务
+│   │   │   ├── service/         业务逻辑与事务（OrderDelayQueue 是 Redis 延迟队列）
+│   │   │   ├── task/            OrderTimeoutTask（超时扫描 + 启动补灌）
 │   │   │   └── util/            JwtUtil
 │   │   └── resources/
 │   │       ├── application.yml               主配置（口令/密钥为环境变量占位符）
@@ -308,8 +364,11 @@ const MOCK_ORDER = false
 
 ## 已知限制
 
-- **没有真实支付**：下单即算「待发货」，没有支付网关
-- **没有 Redis / MQ**：热点行锁的优化手段（库存分桶、预扣、队列削峰）都没做，原因见压测报告
+- **没有真实支付**：下单即算「待发货」，没有支付网关，所以超时取消的依据是「30 分钟未发货」
+- **Redis 只用在延迟队列**：热点行锁的优化手段（库存分桶、预扣、队列削峰）都没做，原因见压测报告；
+  商品缓存也还没上
+- **延迟任务没有重试上限**：`OrderTimeoutTask` 里处理失败会隔 60 秒重新入队，异常数据会一直重试。
+  生产上应该加重试计数 + 死信集合
 - **单机部署**：雪花 ID 的机器号由 MyBatis-Plus 自动推导，多实例部署需要显式配置 workerId
 - **测试覆盖有限**：只有订单模块的 5 个集成测试（下单扣减、库存不足、取消回补、重复取消、软删商品仍回补），其余靠 `curl` 手工验证。
   并发超卖没法用 JUnit 覆盖——测试事务里看不到其他线程未提交的数据，所以那部分由 `benchmark.py --scenario oversell` 承担

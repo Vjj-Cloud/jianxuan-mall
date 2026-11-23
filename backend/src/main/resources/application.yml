@@ -29,6 +29,17 @@ spring:
     date-format: yyyy-MM-dd HH:mm:ss
     time-zone: Asia/Shanghai
 
+  # Redis：订单超时取消的延迟队列。
+  # Spring Boot 3.x 的前缀是 spring.data.redis，不是 2.x 时代的 spring.redis——
+  # 写成旧前缀不会报错，只会静默走 localhost 默认值，很难查。
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
+      # 默认连 db 0。以后做商品缓存也放这里，key 用前缀区分即可。
+      database: 0
+
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
@@ -50,6 +61,13 @@ jwt:
   secret: ${JWT_SECRET}
   # token 有效期（小时）
   expire-hours: 24
+
+# 订单相关
+order:
+  # 未支付订单的超时时间（分钟）。
+  # 用 double 而不是 int，是为了测试时能写成 0.2（12 秒），不必真等半小时。
+  # 不改文件也可以临时覆盖：mvn spring-boot:run -Dspring-boot.run.arguments=--order.timeout-minutes=0.2
+  timeout-minutes: 30
 
 # 接口文档：springdoc + Swagger UI
 springdoc:
