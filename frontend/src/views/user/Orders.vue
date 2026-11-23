@@ -1,11 +1,9 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { listOrders, cancelOrder, confirmOrder } from '@/api/order'
 import { formatPrice, formatDate, orderStatusText, orderStatusType } from '@/utils/format'
 
-const route = useRoute()
 const activeStatus = ref('')
 const orders = ref([])
 const total = ref(0)
@@ -64,7 +62,9 @@ async function handleConfirm(order) {
 }
 
 onMounted(() => {
-  if (route.query.created) ElMessage.success('下单成功，等待商家发货')
+  // 这里不再弹「下单成功」：结算页提交成功后已经提示过一次，
+  // 再根据 ?created=1 弹一条，用户会在半秒内看到两条一模一样的消息。
+  // 提示应该由「执行动作的地方」负责，页面跳转不该重复播报别人的结果。
   fetchOrders()
 })
 </script>

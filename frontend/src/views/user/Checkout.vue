@@ -116,9 +116,12 @@ async function submit() {
     //    而不是再下一单。重新进入结算页会走 onMounted 重新生成，不会污染下一次购买。
     // 2. 购物车刷新改为非阻塞。它失败了最多是右上角角标数字不对，
     //    不能因此把「订单已创建」这个既成事实变成一次页面上的失败停留。
+    //
+    // 「下单成功」只在这里提示一次。订单页原来还会根据 ?created=1 再弹一条，
+    // 两条消息叠在一起，用户看到的是同一个事实被说了两遍——所以那个参数一起去掉了。
     ElMessage.success('下单成功')
     cartStore.load().catch(() => {})
-    await router.replace({ path: '/orders', query: { created: 1 } })
+    await router.replace({ path: '/orders' })
   } catch {
     // 失败提示已由 axios 响应拦截器统一弹出（业务码 / 网络异常 / 401 跳登录）。
     // 这里必须接住，否则 @click 处理函数里的 reject 会变成未处理的 Promise 拒绝，

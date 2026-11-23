@@ -103,9 +103,9 @@ public class ProductCacheEvictor {
             return;
         }
         List<Long> ids = List.copyOf(productIds);
-        ids.forEach(this::deleteQuietly);
+        deleteQuietly(ids);
         try {
-            scheduler.schedule(() -> ids.forEach(this::deleteQuietly),
+            scheduler.schedule(() -> deleteQuietly(ids),
                     COMPENSATE_DELAY_MILLIS, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             // 调度器已关闭（应用正在停机）时会抛 RejectedExecutionException。
@@ -115,16 +115,22 @@ public class ProductCacheEvictor {
     }
 
     /**
-     * 删除单个商品的缓存，异常一律吞掉。
+     * 批量删除，异常一律吞掉。
      *
      * <p>走到这里时订单事务已经提交，业务已经成功。如果因为 Redis 报错把异常抛出去，
      * 调用方看到的就是「接口 500 但订单其实创建成功了」——这比缓存脏 30 分钟严重得多。
+     *
+     * <p><b>一次删完而不是 for 循环</b>：一笔订单最多 50 个商品，逐个 DEL 就是 50 次往返。
+     * Redis 正常时看不出差别（0.2 ms × 50），但网络抖动、每条命令都要等满 500 ms 超时时，
+     * 串起来就是 25 秒——订单已经提交，客户端却早已超时。批量删除只花一次往返，
+     * 而且【熔断中直接跳过】，不会在已知 Redis 不可用时还去白等一次超时。
+     * 具体实现在 {@link ProductCache#evictAll(java.util.Collection)}。
      */
-    private void deleteQuietly(Long productId) {
+    private void deleteQuietly(List<Long> productIds) {
         try {
-            productService.evictDetail(productId);
+            productService.evictDetails(productIds);
         } catch (Exception e) {
-            log.warn("删除商品缓存失败，等 TTL 自然过期 id={}", productId, e);
+            log.warn("删除商品缓存失败，等 TTL 自然过期 ids={}", productIds, e);
         }
     }
 

@@ -21,6 +21,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.time.LocalDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
@@ -188,6 +189,15 @@ public class ProductService {
      */
     public void evictDetail(Long id) {
         productCache.evict(id);
+    }
+
+    /**
+     * 批量失效：一笔订单里可能有多件商品，一次删完只需要一次网络往返。
+     *
+     * @see ProductCache#evictAll(Collection)
+     */
+    public void evictDetails(Collection<Long> ids) {
+        productCache.evictAll(ids);
     }
 
     /* ==================== 管理端：增删改 ==================== */

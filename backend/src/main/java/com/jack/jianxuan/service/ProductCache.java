@@ -10,7 +10,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
+import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -142,11 +144,39 @@ public class ProductCache {
      * 但要知道这是个真实的可靠性缺口。
      */
     public void evict(Long id) {
+        evictAll(List.of(id));
+    }
+
+    /**
+     * 批量删除缓存，一次网络往返。
+     *
+     * <p><b>为什么必须批量：</b>一笔订单最多 50 个商品，逐个 DEL 就是 50 次往返。
+     * Redis 正常时每次约 0.2 ms，看不出问题；但 Redis 网络抖动、每次都要等满 500 ms 超时时，
+     * 50 次串行就是 25 秒——而这段代码跑在「订单已提交」之后，客户端早就超时放弃了。
+     * 订单成功、用户却看到失败提示，是最糟糕的一类体验。DEL 支持多 key，一次就能删完。
+     *
+     * <p><b>为什么熔断中直接返回：</b>{@link CacheHealth#isOpen()} 表示「刚刚确认过 Redis 不可用」。
+     * 这时候还去删，等于明知道会超时还要再等一次——批量之后最多等一次 500 ms，
+     * 但一次也是白等。跳过删除的后果只是缓存脏到 TTL 过期，而 TTL 本来就是兜底手段。
+     *
+     * <p>等待 Redis 恢复的说法不成立：本方法没有重试入口，删除失败就是失败，
+     * 所以「跳过」和「尝试后失败」在结果上完全等价，区别只在响应时间。
+     */
+    public void evictAll(Collection<Long> ids) {
+        if (ids.isEmpty()) {
+            return;
+        }
+        if (cacheHealth.isOpen()) {
+            log.debug("缓存熔断中，跳过删除 ids={}", ids);
+            return;
+        }
+        List<String> keys = ids.stream().map(id -> KEY_PREFIX + id).toList();
         try {
-            redisTemplate.delete(KEY_PREFIX + id);
+            // DEL 支持多 key，Redis 内部逐个删除但只有一次往返。
+            redisTemplate.delete(keys);
         } catch (Exception e) {
             cacheHealth.recordFailure();
-            log.warn("删除商品缓存失败，等 TTL 自然过期 id={}", id, e);
+            log.warn("删除商品缓存失败，等 TTL 自然过期 ids={}", ids, e);
         }
     }
 

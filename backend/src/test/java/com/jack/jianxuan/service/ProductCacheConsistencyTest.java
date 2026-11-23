@@ -6,6 +6,7 @@ import com.jack.jianxuan.dto.OrderVO;
 import com.jack.jianxuan.dto.ProductVO;
 import com.jack.jianxuan.entity.Product;
 import com.jack.jianxuan.mapper.ProductMapper;
+import com.jack.jianxuan.support.RedisTestCleanup;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -83,6 +84,12 @@ class ProductCacheConsistencyTest {
         if (productId == null) {
             return;
         }
+        // 与 OrderIdempotencyTest 同理：先取订单 id 清 Redis 队列，再删库。
+        // 否则每跑一次就在 order:delay 里留一条指向已删订单的任务。
+        List<Long> createdOrderIds = jdbcTemplate.queryForList(
+                "SELECT id FROM orders WHERE user_id = ?", Long.class, TEST_USER_ID);
+        RedisTestCleanup.removeOrderDelayTasks(redisTemplate, createdOrderIds);
+
         jdbcTemplate.update(
                 "DELETE oi FROM order_item oi JOIN orders o ON oi.order_id = o.id WHERE o.user_id = ?",
                 TEST_USER_ID);

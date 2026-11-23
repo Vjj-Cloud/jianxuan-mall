@@ -6,6 +6,7 @@ import com.jack.jianxuan.dto.OrderItemRequest;
 import com.jack.jianxuan.dto.OrderVO;
 import com.jack.jianxuan.entity.Product;
 import com.jack.jianxuan.mapper.ProductMapper;
+import com.jack.jianxuan.support.RedisTestCleanup;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -94,6 +95,13 @@ class OrderIdempotencyTest {
 
     @AfterEach
     void cleanUp() {
+        // 订单 id 必须趁「还没删库」时查出来：订单提交成功后 afterCommit 已经把
+        // 「超时自动取消」任务投进了 Redis，而 DELETE FROM orders 并不会连带删掉它。
+        // 不清理的话，每跑一次测试就在 order:delay 里留下一条指向不存在订单的脏任务。
+        List<Long> createdOrderIds = jdbcTemplate.queryForList(
+                "SELECT id FROM orders WHERE user_id = ?", Long.class, TEST_USER_ID);
+        RedisTestCleanup.removeOrderDelayTasks(redisTemplate, createdOrderIds);
+
         // 先删明细再删订单（没有外键，但顺序仍然保持合理）
         jdbcTemplate.update(
                 "DELETE oi FROM order_item oi JOIN orders o ON oi.order_id = o.id WHERE o.user_id = ?",
