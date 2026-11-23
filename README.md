@@ -15,7 +15,7 @@
 | 后端框架 | Spring Boot 3.5.16 / JDK 17 | 主流组合，Jakarta 命名空间 |
 | 持久层 | MyBatis-Plus 3.5.18 | 单表 CRUD 免写 XML，复杂查询仍可直接写 SQL |
 | 数据库 | MySQL 8 | 事务 + 行锁，防超卖要靠它 |
-| 缓存 / 延迟队列 | Redis 5+ | 订单超时取消用 ZSet 延迟队列；后续商品缓存复用同一套连接 |
+| 缓存 / 延迟队列 | Redis 5+ | 商品详情 Cache-Aside 缓存；订单超时取消用 ZSet 延迟队列 |
 | 认证 | JWT（jjwt 0.12.6）+ BCrypt | 无状态，前后端分离友好 |
 | 接口文档 | springdoc-openapi 2.8.9 | Swagger UI 可直接填 token 调试 |
 | 前端 | Vue 3 + Vite + Element Plus + Pinia | 组合式 API，开发体验好 |
@@ -62,10 +62,11 @@ flowchart LR
     end
 
     DB[("MySQL 8<br/>6 张表")]
-    R[("Redis<br/>order:delay（ZSet）")]
+    R[("Redis<br/>商品缓存 + order:delay")]
 
     V -->|"HTTP /api/**<br/>Authorization: Bearer"| I
     I --> C --> S --> M --> DB
+    S -->|"商品详情 Cache-Aside"| R
     S -->|"事务提交后 ZADD"| R
     T -->|"Lua 原子取出到期任务"| R
     T -->|"调用 cancelBySystem"| S
@@ -282,6 +283,51 @@ return jobs
 所以应用启动时会把库里所有 `PENDING` 订单重新灌一遍队列（`ZADD` 对同 member 是覆盖语义，幂等）。
 队列只是把「多久之后被发现」从小时级缩到秒级，正确性最终不依赖它。
 
+### 7. 商品缓存：Cache-Aside，而且只缓存详情
+
+缓存的判断标准不是「能缓存的都缓存」，而是**能不能说出这个 key 一天读多少次、写多少次**。
+
+| 对象 | 缓存 | 理由 |
+|---|---|---|
+| 商品详情 | ✅ 30 分钟 + 0~300s 抖动 | 一个 id 一个 key，访问集中在少数热门商品 |
+| 分类列表 | ✅ 1 小时 + 0~600s 抖动 | 读极多、写几乎为零 |
+| 商品列表 | ❌ | key 由关键字/分类/排序/页码组合而成，命中率低、白占内存 |
+
+写路径是「**先更库、再删缓存**」，两个顺序问题都不能反：
+
+- **删缓存而不是更新缓存**：并发写时「更新缓存」的落库顺序可能和「改库」颠倒，缓存会永久变脏；
+  删除是幂等的，把一致性责任交给下一次读。
+- **先更库再删**：反过来会留下「删完缓存、更库生效前，读请求把旧值写回」的脏数据。
+
+三个经典问题按数据规模选方案，没有一味堆组件：
+
+| 问题 | 本项目的做法 | 为什么不是另一个 |
+|---|---|---|
+| 穿透（查不存在的 id） | 空值 `__NULL__` 缓存 60s | 布隆过滤器要维护全量 id、不支持删除、还要加组件；这里 id 空间才十几个 |
+| 击穿（热点 key 过期） | SETNX 抢锁重建，其余线程等 50ms 重读，锁用 Lua 比对 token 释放 | 逻辑过期不阻塞但会返回陈旧数据，库存/价格对准确性敏感 |
+| 雪崩（批量同时过期） | TTL 加随机偏移 | —— |
+
+**最麻烦的是库存**：详情里带着 `stock` / `sales`，而每笔订单都会改它们。
+所以下单扣库存（`afterCommit` 里）、取消回补库存之后，都要删掉对应商品的详情缓存，
+否则用户会在 TTL 内一直看到旧库存。代价是热点商品缓存频繁失效——接受它，因为
+详情是「读远多于写」，且库存准确性比命中率重要。量级再大就把库存拆成独立接口，
+详情只缓存静态字段（这是面试问「怎么演进」时的答案）。
+
+**Redis 挂了不能把业务带走**：所有缓存调用 try/catch 降级直查库，再加一个 5 秒熔断
+（`CacheHealth`，一个 volatile 时间戳，没引 Resilience4j）。只做降级是不够的——
+一次详情要碰三次缓存，串行等超时会导致接口慢到 10 秒：
+
+| Redis 停机后 | 只有降级 | 降级 + 熔断 |
+|---|---|---|
+| 第 1 次请求 | 10.05 s | 2.55 s |
+| 后续请求 | 10.0 s | **4.3 ms** |
+
+验证缓存有没有真生效，不能只看接口返回：**绕过接口直接改数据库，再请求接口**——
+如果它仍返回旧值，才证明读的是缓存。另外用 `Com_select` 前后差值量化防击穿：
+50 并发打同一个刚过期的商品，数据库只被查了 **3** 次（无锁是 100 次）。
+
+设计细节与 12 道面试题见 [docs/M8-商品缓存.md](docs/M8-商品缓存.md)。
+
 ---
 
 ## 压测结果
@@ -314,14 +360,14 @@ Jack项目/
 │   ├── src/main/
 │   │   ├── java/com/jack/jianxuan/
 │   │   │   ├── annotation/      @AdminOnly
-│   │   │   ├── common/          Result / BusinessException / GlobalExceptionHandler / UserContext
+│   │   │   ├── common/          Result / BusinessException / GlobalExceptionHandler / UserContext / CacheHealth
 │   │   │   ├── config/          MyBatis-Plus 分页、BCrypt、拦截器注册、OpenAPI
 │   │   │   ├── controller/      用户端与管理端接口
 │   │   │   ├── dto/             请求 DTO 与响应 VO
 │   │   │   ├── entity/          6 张表的实体
 │   │   │   ├── interceptor/     JWT 验签 + 角色校验
 │   │   │   ├── mapper/          MyBatis-Plus Mapper
-│   │   │   ├── service/         业务逻辑与事务（OrderDelayQueue 是 Redis 延迟队列）
+│   │   │   ├── service/         业务逻辑与事务（OrderDelayQueue 延迟队列、ProductCache 商品缓存）
 │   │   │   ├── task/            OrderTimeoutTask（超时扫描 + 启动补灌）
 │   │   │   └── util/            JwtUtil
 │   │   └── resources/
@@ -336,13 +382,15 @@ Jack项目/
     └── cleanup_bench.sql        清理压测产生的订单与商品
 ```
 
-`docs/` 里有每个模块的详细讲解（M0-M5），包含设计取舍、踩过的坑和面试自测题：
+`docs/` 里有每个模块的详细讲解（M0-M8），包含设计取舍、踩过的坑和面试自测题：
 
 | 文档 | 内容 |
 |---|---|
-| [环境配置.md](docs/环境配置.md) | JDK / Maven / MySQL 安装与踩坑 |
+| [环境配置.md](docs/环境配置.md) | JDK / Maven / MySQL / Redis 安装与踩坑 |
 | [api.md](docs/api.md) | 全部接口的请求响应约定 |
 | [M0-M5 代码讲解](docs/) | 统一返回体、JWT、商品、购物车、订单、管理端 |
+| [M7-订单超时取消.md](docs/M7-订单超时取消.md) | ZSet 延迟队列的设计取舍与实测 |
+| [M8-商品缓存.md](docs/M8-商品缓存.md) | Cache-Aside、穿透/击穿/雪崩、降级熔断、12 道面试题 |
 | [压测报告.md](docs/压测报告.md) | 压测数据与瓶颈排查全过程 |
 
 ---
@@ -365,8 +413,9 @@ const MOCK_ORDER = false
 ## 已知限制
 
 - **没有真实支付**：下单即算「待发货」，没有支付网关，所以超时取消的依据是「30 分钟未发货」
-- **Redis 只用在延迟队列**：热点行锁的优化手段（库存分桶、预扣、队列削峰）都没做，原因见压测报告；
-  商品缓存也还没上
+- **Redis 用在缓存和延迟队列两处**：热点行锁的优化手段（库存分桶、预扣、队列削峰）都没做，原因见压测报告
+- **缓存删除失败只靠 TTL 兜底**：改商品时删缓存失败只记日志，最多脏 30 分钟。
+  彻底解决要靠删缓存重试队列或订阅 binlog（Canal），本项目没上
 - **延迟任务没有重试上限**：`OrderTimeoutTask` 里处理失败会隔 60 秒重新入队，异常数据会一直重试。
   生产上应该加重试计数 + 死信集合
 - **单机部署**：雪花 ID 的机器号由 MyBatis-Plus 自动推导，多实例部署需要显式配置 workerId

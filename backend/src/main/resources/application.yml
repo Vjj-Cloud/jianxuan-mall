@@ -36,7 +36,10 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
-      timeout: 2000ms
+      # 命令超时。Redis 与后端同机时正常命令耗时不到 1ms，500ms 已经非常宽松。
+      # 不要往大调：Redis 挂掉时，超时值直接决定每个请求要等多久才降级——
+      # 配成 2s 实测一次商品详情请求会因为三次缓存调用串行等待，慢到 10 秒。
+      timeout: 500ms
       # 默认连 db 0。以后做商品缓存也放这里，key 用前缀区分即可。
       database: 0
 

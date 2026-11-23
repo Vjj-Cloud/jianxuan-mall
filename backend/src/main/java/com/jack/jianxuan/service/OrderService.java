@@ -50,6 +50,7 @@ public class OrderService {
     private final ProductMapper productMapper;
     private final CartItemMapper cartItemMapper;
     private final OrderDelayQueue orderDelayQueue;
+    private final ProductService productService;
 
     /**
      * 创建订单。
@@ -141,19 +142,28 @@ public class OrderService {
                 .eq(CartItem::getUserId, userId)
                 .in(CartItem::getProductId, productIds));
 
-        // 8. 投递「超时未支付自动取消」的延迟任务。
+        // 8. 事务提交之后再做两件事：投递「超时未支付自动取消」的延迟任务、让商品详情缓存失效。
         //
-        //    必须等事务提交之后再投递，不能在方法体里直接 push：
-        //    本方法带 @Transactional，事务提交之前 Redis 就已经有任务了。如果后面任何一步
-        //    抛异常导致回滚（比如上面清购物车失败），订单根本没进库，但延迟任务还在，
-        //    到点就会去取消一个不存在的订单——队列和数据库出现不一致。
+        //    为什么不能写在方法体里：
+        //    本方法带 @Transactional。写在这里的话，事务还没提交、Redis 就已经被改动了。
+        //    一旦后面任何一步抛异常导致回滚（比如上面清购物车失败），订单根本没进库，
+        //    但延迟任务还在，到点就会去取消一个不存在的订单；缓存也被白删一次。
+        //    afterCommit 只在事务真正提交成功后回调，回滚时不会执行，语义天然对齐。
         //
-        //    afterCommit 只在事务真正提交成功后回调，回滚时不会执行，天然对齐。
+        //    另一个坑：afterCommit 里抛出的异常不会被 Spring 吞掉，会一路冒到调用方，
+        //    表现为「订单明明提交成功了，接口却返回 500」。所以这里每个动作都必须自己兜住异常。
         Long createdOrderId = order.getId();
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                orderDelayQueue.pushAfterTimeout(createdOrderId);
+                try {
+                    orderDelayQueue.pushAfterTimeout(createdOrderId);
+                } catch (Exception e) {
+                    // 投递失败 = 这个订单可能永远等不到自动取消。当前靠启动补灌兜底；
+                    // 彻底的做法是本地消息表：把「待投递」和业务数据写进同一个事务，再由后台重试。
+                    log.error("订单 {} 投递超时任务失败，需要补灌兜底", createdOrderId, e);
+                }
+                evictProductCaches(productIds);
             }
         });
 
@@ -199,10 +209,36 @@ public class OrderService {
         }
 
         List<OrderItem> items = loadItems(List.of(orderId)).getOrDefault(orderId, List.of());
+        List<Long> productIds = new ArrayList<>(items.size());
         for (OrderItem item : items) {
             productMapper.restoreStock(item.getProductId(), item.getQuantity());
+            productIds.add(item.getProductId());
         }
+        // 库存回补了，商品详情缓存里的 stock 就成了错的。删缓存放在事务提交前是安全的：
+        // 万一事务回滚，说明库存根本没回补，下次读回源拿到的仍然是正确值。
+        // 会「脏」的从来是「更新缓存」，不是「删除缓存」——这就是 Cache-Aside 删缓存的好处。
+        evictProductCaches(productIds);
         return true;
+    }
+
+    /**
+     * 让这些商品的详情缓存失效。
+     *
+     * <p>商品详情里带着 stock 和 sales，而这两项每笔订单都会变。不删缓存的话，用户在
+     * TTL（30 分钟）内会一直看到旧库存，出现「页面显示有货、下单却提示库存不足」。
+     *
+     * <p>这是一个明确的取舍：热点商品被频繁下单时，缓存会反复失效、命中率下降。
+     * 之所以接受，是因为商品详情是「读远多于写」的场景（浏览下单的比例通常几十比一），
+     * 而且库存准确性比命中率重要得多。
+     *
+     * <p>如果某天真到了「下单频率高到缓存基本用不上」的量级，正确的做法不是停止删缓存，
+     * 而是把「库存」从商品详情里拆出去做成独立的短 TTL 接口，详情页只缓存静态字段。
+     * 能说清这条演进路径，比一开始就上复杂方案更有说服力。
+     */
+    private void evictProductCaches(List<Long> productIds) {
+        for (Long productId : productIds) {
+            productService.evictDetail(productId);
+        }
     }
 
     /** 用户端：只看自己的订单 */
@@ -289,9 +325,13 @@ public class OrderService {
         }
 
         List<OrderItem> items = loadItems(List.of(orderId)).getOrDefault(orderId, List.of());
+        List<Long> productIds = new ArrayList<>(items.size());
         for (OrderItem item : items) {
             productMapper.restoreStock(item.getProductId(), item.getQuantity());
+            productIds.add(item.getProductId());
         }
+        // 库存回补后必须删掉商品详情缓存，否则用户在 TTL 内看到的还是扣减后的库存
+        evictProductCaches(productIds);
         return detail(userId, orderId);
     }
 

@@ -2,7 +2,10 @@ package com.jack.jianxuan.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jack.jianxuan.common.BusinessException;
+import com.jack.jianxuan.common.CacheHealth;
 import com.jack.jianxuan.dto.PageResult;
 import com.jack.jianxuan.dto.ProductQuery;
 import com.jack.jianxuan.dto.ProductSaveRequest;
@@ -12,14 +15,19 @@ import com.jack.jianxuan.entity.Product;
 import com.jack.jianxuan.mapper.CategoryMapper;
 import com.jack.jianxuan.mapper.ProductMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class ProductService {
@@ -27,16 +35,49 @@ public class ProductService {
     /** 新增商品没填封面时的占位图，放在前端 public/covers 下 */
     private static final String DEFAULT_COVER = "/covers/0.svg";
 
+    /** 分类列表缓存 key（全量一份，没有参数组合） */
+    private static final String CATEGORY_CACHE_KEY = "cache:category:list";
+
+    /** 分类缓存 TTL：1 小时。分类是「几乎不变、每次列表页都要读」的典型场景。 */
+    private static final long CATEGORY_TTL_SECONDS = 3600;
+
+    /** 随机偏移上限（秒）：避免同一时刻写入的 key 同时过期 */
+    private static final int CATEGORY_TTL_JITTER_SECONDS = 600;
+
     private final ProductMapper productMapper;
     private final CategoryMapper categoryMapper;
+    private final ProductCache productCache;
+    private final StringRedisTemplate redisTemplate;
+    private final ObjectMapper objectMapper;
+    private final CacheHealth cacheHealth;
 
     /**
      * 分类列表，按 sort 升序。
+     *
+     * <p>这是「读极多、写几乎为零」的典型：每个商品列表页都要把 categoryId 翻成名字，
+     * 但分类一年也改不了几次。缓存 1 小时，命中率接近 100%。
+     *
+     * <p>注意：现在没有分类管理接口，所以这里没有任何 evict 调用。一旦以后加了分类的增删改，
+     * 必须在写操作后删掉 {@link #CATEGORY_CACHE_KEY}，否则改名后前端会一直看到旧名字。
      */
     public List<Category> listCategories() {
-        return categoryMapper.selectList(
+        // 熔断中（Redis 挂了）直接查库，不去等两次超时
+        if (!cacheHealth.isOpen()) {
+            String cached = getCategoryCache();
+            if (cached != null) {
+                List<Category> list = parseCategories(cached);
+                if (list != null) {
+                    return list;
+                }
+                log.warn("分类缓存反序列化失败，按未命中处理");
+            }
+        }
+
+        List<Category> list = categoryMapper.selectList(
                 new LambdaQueryWrapper<Category>().orderByAsc(Category::getSort)
         );
+        putCategoryCache(list);
+        return list;
     }
 
     /**
@@ -115,8 +156,20 @@ public class ProductService {
 
     /**
      * 用户端商品详情：不存在或已下架，一律按 404 处理，不暴露「存在但下架」这种中间态。
+     *
+     * <p>走 Cache-Aside：先查 Redis，未命中再回源并回填。穿透 / 击穿 / 雪崩的处理都在
+     * {@link ProductCache} 里，这里只负责「缓存没有时怎么查库」。
      */
     public ProductVO detail(Long id) {
+        return productCache.get(id, () -> loadDetail(id));
+    }
+
+    /**
+     * 真正查库并组装详情。缓存未命中时由 {@link ProductCache} 回调。
+     *
+     * <p>这里查了两次库（商品 + 分类），缓存命中时这两次都省掉了——这就是缓存的收益来源。
+     */
+    private ProductVO loadDetail(Long id) {
         Product product = productMapper.selectById(id);
         if (product == null || !Integer.valueOf(1).equals(product.getStatus())) {
             throw new BusinessException(404, "商品不存在或已下架");
@@ -125,6 +178,16 @@ public class ProductService {
         Category category = categoryMapper.selectById(product.getCategoryId());
         vo.setCategoryName(category == null ? "" : category.getName());
         return vo;
+    }
+
+    /**
+     * 让某个商品的详情缓存失效。
+     *
+     * <p>除了本类里的写操作，{@link OrderService} 在下单扣库存、取消回补库存之后也要调——
+     * 商品详情里带着 stock / sales，那两项每笔订单都会变。
+     */
+    public void evictDetail(Long id) {
+        productCache.evict(id);
     }
 
     /* ==================== 管理端：增删改 ==================== */
@@ -150,6 +213,9 @@ public class ProductService {
         product.setDescription(req.getDesc() == null ? "" : req.getDesc());
 
         productMapper.insert(product);
+        // 新建一般不需要删缓存（这个 id 之前不存在），但万一有请求提前查过这个 id、
+        // 把「不存在」的空值缓存写进去了，这里删一次能避免新商品上线后最长 60 秒还是 404。
+        productCache.evict(product.getId());
         return toVO(product, true);
     }
 
@@ -201,6 +267,8 @@ public class ProductService {
         // 显式赋了值，数据库的 ON UPDATE CURRENT_TIMESTAMP 就不再自动生效
         product.setUpdatedAt(LocalDateTime.now());
         productMapper.updateById(product);
+        // 先更库、再删缓存。顺序反了会留下「删完缓存、更库生效前，读请求把旧值写回」的脏数据。
+        productCache.evict(id);
         return toVO(product, true);
     }
 
@@ -211,6 +279,7 @@ public class ProductService {
     public void delete(Long id) {
         getExisting(id);
         productMapper.deleteById(id);
+        productCache.evict(id);
     }
 
     public ProductVO updateStatus(Long id, Integer status) {
@@ -218,6 +287,8 @@ public class ProductService {
         product.setStatus(normalizeStatus(status));
         product.setUpdatedAt(LocalDateTime.now());
         productMapper.updateById(product);
+        // 下架必须删缓存：否则缓存里还是「在售」状态，用户点进去看到详情却能下单，下单时才报错
+        productCache.evict(id);
         return toVO(product, true);
     }
 
@@ -253,6 +324,37 @@ public class ProductService {
     private Map<Long, String> categoryNameMap() {
         return listCategories().stream()
                 .collect(Collectors.toMap(Category::getId, Category::getName, (a, b) -> a));
+    }
+
+    /* ==================== 分类缓存读写（全部失败降级，不影响主流程） ==================== */
+
+    private String getCategoryCache() {
+        try {
+            return redisTemplate.opsForValue().get(CATEGORY_CACHE_KEY);
+        } catch (Exception e) {
+            cacheHealth.recordFailure();
+            log.warn("读分类缓存失败，降级查库", e);
+            return null;
+        }
+    }
+
+    private void putCategoryCache(List<Category> list) {
+        try {
+            String json = objectMapper.writeValueAsString(list);
+            long ttl = CATEGORY_TTL_SECONDS + ThreadLocalRandom.current().nextInt(CATEGORY_TTL_JITTER_SECONDS);
+            redisTemplate.opsForValue().set(CATEGORY_CACHE_KEY, json, ttl, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            cacheHealth.recordFailure();
+            log.warn("写分类缓存失败", e);
+        }
+    }
+
+    private List<Category> parseCategories(String json) {
+        try {
+            return objectMapper.readValue(json, new TypeReference<List<Category>>() { });
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private void applySort(LambdaQueryWrapper<Product> wrapper, String sort) {
