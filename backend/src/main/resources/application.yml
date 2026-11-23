@@ -9,6 +9,13 @@ spring:
     url: jdbc:mysql://localhost:3306/jianxuan_mall?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
     username: mall
     password: REDACTED
+    hikari:
+      # 默认 10。压测发现下单接口在 16 并发时 138 req/s，加到 32 并发只有 147 req/s
+      # 且延迟翻倍——说明请求在排队等连接，不是在算。调到 20 后复测见 docs/压测报告.md。
+      # 上线时这个值要按「DB 最大连接数 ÷ 实例数」来定，不是越大越好：
+      # 连接数超过 CPU 核数 × 2 之后，上下文切换反而会拖慢整体吞吐。
+      maximum-pool-size: 20
+      connection-timeout: 3000
   jackson:
     date-format: yyyy-MM-dd HH:mm:ss
     time-zone: Asia/Shanghai
@@ -16,7 +23,10 @@ spring:
 mybatis-plus:
   configuration:
     map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    # 不要用 StdOutImpl：它把每条 SQL 直接 System.out.println，压测时控制台同步 IO
+    # 会变成真正的瓶颈（实测下单 112ms/请求，换成 Slf4jImpl 后见 docs/压测报告.md）。
+    # Slf4jImpl 走日志框架，级别可控：平时 info 不打 SQL，要排查时改下面的 debug。
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
   global-config:
     db-config:
       id-type: auto
@@ -31,13 +41,17 @@ jwt:
   # token 有效期（小时）
   expire-hours: 24
 
-# Knife4j / springdoc
+# 接口文档：springdoc + Swagger UI
 springdoc:
   api-docs:
     path: /v3/api-docs
   swagger-ui:
     path: /swagger-ui.html
-knife4j:
-  enable: true
-  setting:
-    language: zh_cn
+    # 按 HTTP 方法分组排序，比默认的字母序更接近阅读习惯
+    operations-sorter: method
+    tags-sorter: alpha
+
+# 想看 SQL 时把 mapper 包改成 debug，会打印 PreparedStatement 和参数
+logging:
+  level:
+    com.jack.jianxuan.mapper: info

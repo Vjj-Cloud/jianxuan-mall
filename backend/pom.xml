@@ -20,7 +20,14 @@
         <java.version>17</java.version>
         <mybatis-plus.version>3.5.18.1</mybatis-plus.version>
         <jjwt.version>0.12.6</jjwt.version>
-        <knife4j.version>4.5.0</knife4j.version>
+        <!--
+            接口文档用 springdoc 官方 starter，不再用 knife4j。
+            原因：knife4j 4.5.0（2023 年底之后停更）绑死了 springdoc 2.3.0，
+            而 2.3.0 在 Spring Framework 6.2 上会抛 NoSuchMethodError(ControllerAdviceBean)；
+            把 springdoc 升到 2.8.9 后，knife4j 又反过来调不到新 API(getGroupConfigs)。
+            两边都不兼容，只能二选一。为了不降级 Spring Boot，选官方 UI。
+        -->
+        <springdoc.version>2.8.9</springdoc.version>
     </properties>
 
     <dependencies>
@@ -83,11 +90,11 @@
             <artifactId>spring-security-crypto</artifactId>
         </dependency>
 
-        <!-- 接口文档 Knife4j（Boot 3 + Jakarta 专用） -->
+        <!-- 接口文档：springdoc 官方 OpenAPI 3 + Swagger UI（访问 /swagger-ui.html） -->
         <dependency>
-            <groupId>com.github.xiaoymin</groupId>
-            <artifactId>knife4j-openapi3-jakarta-spring-boot-starter</artifactId>
-            <version>${knife4j.version}</version>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc.version}</version>
         </dependency>
 
         <!-- Lombok -->
